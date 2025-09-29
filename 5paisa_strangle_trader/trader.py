@@ -447,7 +447,7 @@ def check_trade_conditions():
             total_pnl += (entry_data[pe_scrip_code]['entry_price'] - pe_ltp) * config.QTY
 
     if not active_legs: # If both legs have been closed individually
-        logging..info("Both legs have been closed. Finalizing trade.")
+        logging.info("Both legs have been closed. Finalizing trade.")
         action_queue.put({'action': 'exit', 'reason': 'BOTH_LEGS_CLOSED'})
         return
 
