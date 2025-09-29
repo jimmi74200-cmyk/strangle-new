@@ -3,7 +3,7 @@ from py5paisa import FivePaisaClient
 import config
 
 # Configure basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 def test_sl_cancellation():
     """
@@ -32,12 +32,13 @@ def test_sl_cancellation():
             logging.info("Order book is empty. No orders found.")
             return
 
-        # Filter for orders that are pending and are stop-loss orders.
-        # Common statuses for pending SL orders are 'Pending' or 'Trigger Pending'.
-        # A stop-loss order is identified by having a StopLossPrice > 0.
+        # ✅ Updated filter for SL orders:
+        # - Check for SLTriggerRate > 0
+        # - Include additional statuses like "AH Placed"
         pending_sl_orders = [
             order for order in order_book
-            if order.get('OrderStatus') in ['Pending', 'Trigger Pending'] and order.get('StopLossPrice', 0) > 0
+            if order.get("OrderStatus", "").strip() in ["Pending", "Trigger Pending", "Open", "Modified", "AH Placed"]
+            and float(order.get("SLTriggerRate", 0)) > 0
         ]
 
         if not pending_sl_orders:
@@ -50,7 +51,8 @@ def test_sl_cancellation():
             print(f"  Broker Order ID: {order.get('BrokerOrderId')}")
             print(f"  Scrip Name:      {order.get('ScripName')}")
             print(f"  Quantity:        {order.get('Qty')}")
-            print(f"  Stop-Loss Price: {order.get('StopLossPrice')}")
+            print(f"  SL Trigger Rate: {order.get('SLTriggerRate')}")
+            print(f"  Status:          {order.get('OrderStatus').strip()}")
             print("-" * 50)
 
         # Prompt user for the ID to cancel
@@ -60,8 +62,11 @@ def test_sl_cancellation():
                 print("No Order ID entered. Exiting.")
                 return
 
-            # Find the chosen order to confirm details before cancelling
-            order_to_cancel = next((o for o in pending_sl_orders if str(o.get('BrokerOrderId')) == target_order_id), None)
+            # Confirm order exists
+            order_to_cancel = next(
+                (o for o in pending_sl_orders if str(o.get("BrokerOrderId")) == target_order_id),
+                None
+            )
 
             if not order_to_cancel:
                 print(f"Error: Order ID {target_order_id} not found in the list of pending SL orders.")
@@ -69,11 +74,10 @@ def test_sl_cancellation():
 
             print(f"\nAttempting to cancel order {target_order_id} ({order_to_cancel.get('ScripName')})...")
 
-            # Perform the cancellation
+            # Perform cancellation
             cancellation_result = client.cancel_order(target_order_id)
 
-            # The API returns a list with a dictionary inside on success
-            if cancellation_result and isinstance(cancellation_result, list) and cancellation_result[0].get('Status') == 0:
+            if cancellation_result and isinstance(cancellation_result, list) and cancellation_result[0].get("Status") == 0:
                 logging.info(f"Successfully sent cancellation request for order {target_order_id}.")
                 print(f"Message from server: {cancellation_result[0].get('Message')}")
             else:
