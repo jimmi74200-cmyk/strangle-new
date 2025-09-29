@@ -264,6 +264,41 @@ def select_strikes(option_chain, method, premium, spot_price):
             logging.error(f"Invalid strike selection method: {method}")
             return None, None
 
+def _place_order_with_retry(order_type, scrip_code, qty, max_retries=3, retry_delay=5, **kwargs):
+    """Places an order and retries if it fails."""
+    for i in range(max_retries):
+        try:
+            order_result = client.place_order(
+                OrderType=order_type,
+                Exchange='N',
+                ExchangeType='D',
+                ScripCode=scrip_code,
+                Qty=qty,
+                Price=0, # Market order
+                IsIntraday=True,
+                **kwargs
+            )
+
+            # The py5paisa library returns a dictionary.
+            # Based on 5paisa docs, 'Status': 0 and 'Message': 'Success' indicate success.
+            # However, the library might add its own layers. Let's check the raw message too.
+            # A successful placement seems to return a dict with 'Status' == 0.
+            # A rejection returns a dict with 'Status' != 0 and a 'Message'.
+            if order_result and order_result.get('Status') == 0 and 'Success' in order_result.get('Message', ''):
+                logging.info(f"Order placed successfully for ScripCode {scrip_code}. BrokerOrderID: {order_result.get('BrokerOrderID')}")
+                return order_result
+            else:
+                error_message = order_result.get('Message', 'Unknown error')
+                logging.warning(f"Order placement failed for ScripCode {scrip_code}. Reason: '{error_message}'. Retrying ({i+1}/{max_retries})...")
+                time.sleep(retry_delay)
+
+        except Exception as e:
+            logging.error(f"Exception during order placement for ScripCode {scrip_code}: {e}. Retrying ({i+1}/{max_retries})...")
+            time.sleep(retry_delay)
+
+    logging.error(f"Failed to place order for ScripCode {scrip_code} after {max_retries} retries.")
+    return None
+
 def place_strangle_order():
     global pending_sl_order_ids, entry_data, ce_scrip_code, pe_scrip_code, trade_is_active, active_legs
     if trade_is_active:
@@ -309,81 +344,87 @@ def place_strangle_order():
                 else:
                     logging.error("Could not fetch live prices for paper trade entry. Halting strategy.")
             else:
-                # Place initial orders
-                ce_order_result = client.place_order(OrderType='S', Exchange='N', ExchangeType='D', ScripCode=ce_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-                pe_order_result = client.place_order(OrderType='S', Exchange='N', ExchangeType='D', ScripCode=pe_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
+                # Place initial orders using the new robust function
+                logging.info(f"Placing strangle orders for {config.SYMBOL}...")
+                ce_order_result = _place_order_with_retry('S', ce_scrip_code, config.QTY)
+                pe_order_result = _place_order_with_retry('S', pe_scrip_code, config.QTY)
 
-                ce_broker_id = ce_order_result.get('BrokerOrderID') if ce_order_result else None
-                pe_broker_id = pe_order_result.get('BrokerOrderID') if pe_order_result else None
-                logging.info(f"Strangle orders placed. CE Broker ID: {ce_broker_id}, PE Broker ID: {pe_broker_id}. Waiting for execution...")
+                # --- Handle partial or failed execution ---
+                if ce_order_result and pe_order_result:
+                    logging.info("Both CE and PE legs placed successfully. Proceeding to confirmation.")
 
-                # --- Final Position-First Confirmation Loop ---
-                for i in range(12): # 60 seconds timeout
+                    # --- Final Confirmation and SL Placement ---
+                    for i in range(12): # 60 seconds timeout
+                        positions = client.positions()
+                        ce_pos = next((p for p in (positions or []) if p['ScripCode'] == ce_scrip_code), None)
+                        pe_pos = next((p for p in (positions or []) if p['ScripCode'] == pe_scrip_code), None)
+
+                        if ce_pos and pe_pos:
+                            logging.info("Both legs confirmed in positions. Fetching entry prices and placing SL orders.")
+
+                            # Get entry prices
+                            ce_entry_price = ce_pos['SellAvgRate']
+                            pe_entry_price = pe_pos['SellAvgRate']
+                            entry_data[ce_scrip_code] = {'strike': ce_strike, 'entry_price': ce_entry_price}
+                            entry_data[pe_scrip_code] = {'strike': pe_strike, 'entry_price': pe_entry_price}
+                            logging.info(f"CE Entry: {ce_entry_price}, PE Entry: {pe_entry_price}")
+
+                            # Place SL orders
+                            sl_price_ce = ce_entry_price + config.LEG_WISE_SL_POINTS
+                            limit_price_ce = sl_price_ce + config.SL_LIMIT_BUFFER
+                            sl_ce_order = client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=ce_scrip_code, Qty=abs(ce_pos['NetQty']), Price=limit_price_ce, StopLossPrice=sl_price_ce, IsIntraday=True)
+                            if sl_ce_order and sl_ce_order.get('Status') == 0:
+                                logging.info(f"Placed SL order for CE leg at {sl_price_ce}.")
+                                pending_sl_order_ids.append(sl_ce_order.get('BrokerOrderID'))
+                            else:
+                                logging.error(f"Failed to place SL order for CE leg. Reason: {sl_ce_order.get('Message') if sl_ce_order else 'Unknown'}")
+
+                            sl_price_pe = pe_entry_price + config.LEG_WISE_SL_POINTS
+                            limit_price_pe = sl_price_pe + config.SL_LIMIT_BUFFER
+                            sl_pe_order = client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=pe_scrip_code, Qty=abs(pe_pos['NetQty']), Price=limit_price_pe, StopLossPrice=sl_price_pe, IsIntraday=True)
+                            if sl_pe_order and sl_pe_order.get('Status') == 0:
+                                logging.info(f"Placed SL order for PE leg at {sl_price_pe}.")
+                                pending_sl_order_ids.append(sl_pe_order.get('BrokerOrderID'))
+                            else:
+                                logging.error(f"Failed to place SL order for PE leg. Reason: {sl_pe_order.get('Message') if sl_pe_order else 'Unknown'}")
+
+                            # Subscribe to live feed and activate trade
+                            ws_manager.subscribe([
+                                {"Exch": "N", "ExchType": "D", "ScripCode": ce_scrip_code},
+                                {"Exch": "N", "ExchType": "D", "ScripCode": pe_scrip_code}
+                            ])
+                            active_legs = {'CE': ce_scrip_code, 'PE': pe_scrip_code}
+                            trade_is_active = True
+                            logging.info("Trade is now active. Monitoring P&L.")
+                            return
+
+                        logging.info(f"Waiting for position confirmation... ({i+1}/12)")
+                        time.sleep(5)
+
+                    logging.critical("CRITICAL ERROR: Failed to confirm execution of both legs in positions after 60s. Manual check required.")
+                    # Attempt to square off any position that might have been created, to be safe.
                     positions = client.positions()
-                    ce_pos = next((p for p in positions if p['ScripCode'] == ce_scrip_code), None) if positions else None
-                    pe_pos = next((p for p in positions if p['ScripCode'] == pe_scrip_code), None) if positions else None
+                    if any(p['ScripCode'] == ce_scrip_code for p in (positions or [])):
+                         logging.warning("Attempting to square off CE leg as a precaution.")
+                         _place_order_with_retry('B', ce_scrip_code, config.QTY, max_retries=3)
+                    if any(p['ScripCode'] == pe_scrip_code for p in (positions or [])):
+                         logging.warning("Attempting to square off PE leg as a precaution.")
+                         _place_order_with_retry('B', pe_scrip_code, config.QTY, max_retries=3)
+                    return # Halt strategy
 
-                    if ce_pos and pe_pos:
-                        logging.info("Both legs confirmed in positions.")
-                        entry_data[ce_scrip_code] = {'strike': ce_strike, 'entry_price': ce_pos['SellAvgRate']}
-                        sl_price_ce = ce_pos['SellAvgRate'] + config.LEG_WISE_SL_POINTS
-                        limit_price_ce = sl_price_ce + config.SL_LIMIT_BUFFER
-                        client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=ce_scrip_code, Qty=abs(ce_pos['NetQty']), Price=limit_price_ce, StopLossPrice=sl_price_ce, IsIntraday=True)
-
-                        entry_data[pe_scrip_code] = {'strike': pe_strike, 'entry_price': pe_pos['SellAvgRate']}
-                        sl_price_pe = pe_pos['SellAvgRate'] + config.LEG_WISE_SL_POINTS
-                        limit_price_pe = sl_price_pe + config.SL_LIMIT_BUFFER
-                        client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=pe_scrip_code, Qty=abs(pe_pos['NetQty']), Price=limit_price_pe, StopLossPrice=sl_price_pe, IsIntraday=True)
-
-                        ws_manager.subscribe([
-                            {"Exch": "N", "ExchType": "D", "ScripCode": ce_scrip_code},
-                            {"Exch": "N", "ExchType": "D", "ScripCode": pe_scrip_code}
-                        ])
-                        active_legs = {'CE': ce_scrip_code, 'PE': pe_scrip_code}
-                        trade_is_active = True
-                        logging.info("Trade is now active.")
-                        return
-
-                    # If a leg is missing, check the order book for a potential rejection
-                    if i > 1: # Start checking order book only after a couple of seconds
-                        order_book = client.order_book()
-                        if not ce_pos:
-                            ce_order = next((o for o in order_book if str(o.get('BrokerOrderId')) == str(ce_broker_id)), None) if ce_broker_id and order_book else None
-                            if ce_order and ce_order.get('OrderStatus') in ['Rejected', 'Cancelled']:
-                                reason = ce_order.get('Reason', '')
-                                if "closed" in reason:
-                                    logging.critical(f"CE order rejected because market is closed. Reason: {reason}. Halting strategy.")
-                                    return
-                                logging.warning(f"CE order {ce_broker_id} was {ce_order.get('OrderStatus')}. Reason: {reason}. Retrying...")
-                                ce_order_result = client.place_order(OrderType='S', Exchange='N', ExchangeType='D', ScripCode=ce_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-                                ce_broker_id = ce_order_result.get('BrokerOrderId') if ce_order_result and ce_order_result.get('Status') == 0 else None
-
-                        if not pe_pos:
-                            pe_order = next((o for o in order_book if str(o.get('BrokerOrderId')) == str(pe_broker_id)), None) if pe_broker_id and order_book else None
-                            if pe_order and pe_order.get('OrderStatus') in ['Rejected', 'Cancelled']:
-                                reason = pe_order.get('Reason', '')
-                                if "closed" in reason:
-                                    logging.critical(f"PE order rejected because market is closed. Reason: {reason}. Halting strategy.")
-                                    return
-                                logging.warning(f"PE order {pe_broker_id} was {pe_order.get('OrderStatus')}. Reason: {reason}. Retrying...")
-                                pe_order_result = client.place_order(OrderType='S', Exchange='N', ExchangeType='D', ScripCode=pe_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-                                pe_broker_id = pe_order_result.get('BrokerOrderId') if pe_order_result and pe_order_result.get('Status') == 0 else None
-
-                    logging.info(f"Waiting for position confirmation... ({i+1}/12)")
-                    time.sleep(5)
-
-                logging.critical("CRITICAL ERROR: Failed to confirm execution of both legs after 60s.")
-                positions = client.positions()
-                ce_pos = any(p['ScripCode'] == ce_scrip_code for p in positions)
-                pe_pos = any(p['ScripCode'] == pe_scrip_code for p in positions)
-                if ce_pos and not pe_pos:
-                    logging.critical("PE leg failed. Squaring off naked CE position.")
-                    client.squareoff('N', 'D', ce_scrip_code)
-                elif not ce_pos and pe_pos:
-                    logging.critical("CE leg failed. Squaring off naked PE position.")
-                    client.squareoff('N', 'D', pe_scrip_code)
-                else:
-                    logging.error("Neither leg seems to have executed. Manual check required.")
+                elif ce_order_result and not pe_order_result:
+                    logging.critical("PE leg failed to place. Squaring off the successful CE leg to avoid a naked position.")
+                    _place_order_with_retry('B', ce_scrip_code, config.QTY, max_retries=5) # Use more retries for critical square-off
+                    logging.error("Strategy halted for the day due to partial execution failure.")
+                    return # Stop execution for the day
+                elif not ce_order_result and pe_order_result:
+                    logging.critical("CE leg failed to place. Squaring off the successful PE leg to avoid a naked position.")
+                    _place_order_with_retry('B', pe_scrip_code, config.QTY, max_retries=5) # Use more retries for critical square-off
+                    logging.error("Strategy halted for the day due to partial execution failure.")
+                    return # Stop execution for the day
+                else: # Both failed
+                    logging.critical("Both CE and PE legs failed to place. Strategy halted for the day.")
+                    return # Stop execution for the day
         else:
             logging.error("Could not find scrip codes for selected strikes.")
     else:
@@ -424,42 +465,44 @@ def exit_positions(reason="Unknown"):
     global pending_sl_order_ids, entry_data, realized_pnl, ce_scrip_code, pe_scrip_code, trade_is_active, max_pnl, trailing_sl_activated, active_legs
     if not trade_is_active: return
     logging.info(f"Exiting all positions due to: {reason}")
-    if ws_manager and ce_scrip_code and pe_scrip_code:
-        ws_manager.unsubscribe([
-            {"Exch": "N", "ExchType": "D", "ScripCode": ce_scrip_code},
-            {"Exch": "N", "ExchType": "D", "ScripCode": pe_scrip_code}
-        ])
+
+    # Build unsubscribe list from active legs before modifying the dictionary
+    scrips_to_unsubscribe = [{"Exch": "N", "ExchType": "D", "ScripCode": sc} for sc in active_legs.values()]
+    if ws_manager and scrips_to_unsubscribe:
+        logging.info(f"Unsubscribing from {len(scrips_to_unsubscribe)} scrips.")
+        ws_manager.unsubscribe(scrips_to_unsubscribe)
 
     ce_exit_price = ltp_store.get(ce_scrip_code, 0)
     pe_exit_price = ltp_store.get(pe_scrip_code, 0)
 
     if not config.PAPER_TRADING:
         # First, cancel any pending SL orders to avoid them executing during our exit.
-        for order_id in pending_sl_order_ids:
-            try:
-                client.cancel_order(order_id)
-                logging.info(f"Successfully cancelled pending SL order: {order_id}")
-            except Exception as e:
-                logging.error(f"Error cancelling SL order {order_id}: {e}")
+        if pending_sl_order_ids:
+            logging.info(f"Cancelling {len(pending_sl_order_ids)} pending SL order(s)...")
+            for order_id in pending_sl_order_ids:
+                try:
+                    client.cancel_order(order_id)
+                    logging.info(f"Successfully cancelled pending SL order: {order_id}")
+                except Exception as e:
+                    # Log error but continue, as the order might have already executed
+                    logging.error(f"Error cancelling SL order {order_id}: {e}. It might have already executed.")
+            pending_sl_order_ids = [] # Clear the list after attempting cancellation
 
-        # Now, explicitly square off each leg of our trade
-        logging.info("Placing explicit market orders to exit positions.")
-        if ce_scrip_code in entry_data:
-            try:
-                # To square off a short position, we place a buy order
-                client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=ce_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-                logging.info(f"Exit order placed for CE leg (ScripCode: {ce_scrip_code}).")
-            except Exception as e:
-                logging.error(f"Error placing exit order for CE leg: {e}")
-
-        if pe_scrip_code in entry_data:
-            try:
-                client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=pe_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-                logging.info(f"Exit order placed for PE leg (ScripCode: {pe_scrip_code}).")
-            except Exception as e:
-                logging.error(f"Error placing exit order for PE leg: {e}")
-
-        logging.info("All exit orders placed.")
+        # Now, explicitly square off each active leg using our robust function
+        logging.info("Placing market orders to exit active positions.")
+        # Create a copy of items to iterate over, as active_legs might be changed by other threads
+        for leg_type, scrip_code in list(active_legs.items()):
+            if scrip_code in entry_data:
+                logging.info(f"Attempting to square off {leg_type} leg (ScripCode: {scrip_code}).")
+                # To square off a short position, we place a simple market buy order
+                _place_order_with_retry(
+                    order_type='B',
+                    scrip_code=scrip_code,
+                    qty=config.QTY,
+                    max_retries=5, # Use more retries for critical exits
+                    retry_delay=3
+                )
+        logging.info("All exit order requests placed.")
 
     final_pnl = realized_pnl
     if ce_scrip_code in entry_data:
