@@ -344,10 +344,27 @@ def place_strangle_order():
                 else:
                     logging.error("Could not fetch live prices for paper trade entry. Halting strategy.")
             else:
-                # Place initial orders using the new robust function
-                logging.info(f"Placing strangle orders for {config.SYMBOL}...")
-                ce_order_result = _place_order_with_retry('S', ce_scrip_code, config.QTY)
-                pe_order_result = _place_order_with_retry('S', pe_scrip_code, config.QTY)
+                # Place initial orders concurrently using threading to minimize delay
+                logging.info(f"Placing strangle orders for {config.SYMBOL} concurrently...")
+
+                results = {}
+                def place_leg(leg_type, scrip_code):
+                    """Target function for the thread to place one leg."""
+                    results[leg_type] = _place_order_with_retry('S', scrip_code, config.QTY)
+
+                ce_thread = threading.Thread(target=place_leg, args=('CE', ce_scrip_code))
+                pe_thread = threading.Thread(target=place_leg, args=('PE', pe_scrip_code))
+
+                # Start both threads at nearly the same time
+                ce_thread.start()
+                pe_thread.start()
+
+                # Wait for both threads to complete before proceeding
+                ce_thread.join()
+                pe_thread.join()
+
+                ce_order_result = results.get('CE')
+                pe_order_result = results.get('PE')
 
                 # --- Handle partial or failed execution ---
                 if ce_order_result and pe_order_result:
