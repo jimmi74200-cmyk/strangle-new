@@ -264,20 +264,22 @@ def select_strikes(option_chain, method, premium, spot_price):
             logging.error(f"Invalid strike selection method: {method}")
             return None, None
 
-def _place_order_with_retry(order_type, scrip_code, qty, max_retries=3, retry_delay=5, **kwargs):
-    """Places an order and retries if it fails."""
+def _place_order_with_retry(order_type, scrip_code, qty, lock, max_retries=3, retry_delay=5, **kwargs):
+    """Places an order and retries if it fails, using a lock to ensure thread safety."""
     for i in range(max_retries):
         try:
-            order_result = client.place_order(
-                OrderType=order_type,
-                Exchange='N',
-                ExchangeType='D',
-                ScripCode=scrip_code,
-                Qty=qty,
-                Price=0, # Market order
-                IsIntraday=True,
-                **kwargs
-            )
+            # The lock ensures that only one thread can execute client.place_order at a time.
+            with lock:
+                order_result = client.place_order(
+                    OrderType=order_type,
+                    Exchange='N',
+                    ExchangeType='D',
+                    ScripCode=scrip_code,
+                    Qty=qty,
+                    Price=0, # Market order
+                    IsIntraday=True,
+                    **kwargs
+                )
 
             # The py5paisa library returns a dictionary.
             # Based on 5paisa docs, 'Status': 0 and 'Message': 'Success' indicate success.
@@ -348,9 +350,10 @@ def place_strangle_order():
                 logging.info(f"Placing strangle orders for {config.SYMBOL} concurrently...")
 
                 results = {}
+                order_lock = threading.Lock() # Lock to make client calls thread-safe
                 def place_leg(leg_type, scrip_code):
                     """Target function for the thread to place one leg."""
-                    results[leg_type] = _place_order_with_retry('S', scrip_code, config.QTY)
+                    results[leg_type] = _place_order_with_retry('S', scrip_code, config.QTY, lock=order_lock)
 
                 ce_thread = threading.Thread(target=place_leg, args=('CE', ce_scrip_code))
                 pe_thread = threading.Thread(target=place_leg, args=('PE', pe_scrip_code))
@@ -420,23 +423,24 @@ def place_strangle_order():
 
                     logging.critical("CRITICAL ERROR: Failed to confirm execution of both legs in positions after 60s. Manual check required.")
                     # Attempt to square off any position that might have been created, to be safe.
+                    square_off_lock = threading.Lock()
                     positions = client.positions()
                     if any(p['ScripCode'] == ce_scrip_code for p in (positions or [])):
                          logging.warning("Attempting to square off CE leg as a precaution.")
-                         _place_order_with_retry('B', ce_scrip_code, config.QTY, max_retries=3)
+                         _place_order_with_retry('B', ce_scrip_code, config.QTY, lock=square_off_lock, max_retries=3)
                     if any(p['ScripCode'] == pe_scrip_code for p in (positions or [])):
                          logging.warning("Attempting to square off PE leg as a precaution.")
-                         _place_order_with_retry('B', pe_scrip_code, config.QTY, max_retries=3)
+                         _place_order_with_retry('B', pe_scrip_code, config.QTY, lock=square_off_lock, max_retries=3)
                     return # Halt strategy
 
                 elif ce_order_result and not pe_order_result:
                     logging.critical("PE leg failed to place. Squaring off the successful CE leg to avoid a naked position.")
-                    _place_order_with_retry('B', ce_scrip_code, config.QTY, max_retries=5) # Use more retries for critical square-off
+                    _place_order_with_retry('B', ce_scrip_code, config.QTY, lock=threading.Lock(), max_retries=5) # Use more retries for critical square-off
                     logging.error("Strategy halted for the day due to partial execution failure.")
                     return # Stop execution for the day
                 elif not ce_order_result and pe_order_result:
                     logging.critical("CE leg failed to place. Squaring off the successful PE leg to avoid a naked position.")
-                    _place_order_with_retry('B', pe_scrip_code, config.QTY, max_retries=5) # Use more retries for critical square-off
+                    _place_order_with_retry('B', pe_scrip_code, config.QTY, lock=threading.Lock(), max_retries=5) # Use more retries for critical square-off
                     logging.error("Strategy halted for the day due to partial execution failure.")
                     return # Stop execution for the day
                 else: # Both failed
@@ -507,6 +511,7 @@ def exit_positions(reason="Unknown"):
 
         # Now, explicitly square off each active leg using our robust function
         logging.info("Placing market orders to exit active positions.")
+        exit_lock = threading.Lock() # Create a lock for exiting
         # Create a copy of items to iterate over, as active_legs might be changed by other threads
         for leg_type, scrip_code in list(active_legs.items()):
             if scrip_code in entry_data:
@@ -516,6 +521,7 @@ def exit_positions(reason="Unknown"):
                     order_type='B',
                     scrip_code=scrip_code,
                     qty=config.QTY,
+                    lock=exit_lock, # Pass the lock
                     max_retries=5, # Use more retries for critical exits
                     retry_delay=3
                 )
