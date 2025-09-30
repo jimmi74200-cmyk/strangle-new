@@ -143,7 +143,8 @@ def index():
         return redirect(url_for('index'))
 
     config_data = get_config_values()
-    return render_template('index.html', categorized_config=config_data, schema=CONFIG_SCHEMA)
+    # Pass the isinstance function to the template context so it can be used for type checking
+    return render_template('index.html', categorized_config=config_data, schema=CONFIG_SCHEMA, isinstance=isinstance)
 
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
