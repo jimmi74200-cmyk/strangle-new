@@ -12,7 +12,7 @@ CONFIG_FILE_PATH = os.path.join(os.path.dirname(__file__), 'config.py')
 CONFIG_SCHEMA = {
     "Trading Parameters": {
         "PAPER_TRADING": bool,
-        "SYMBOL": ["NIFTY", "BANKNIFTY", "FINNIFTY"],
+        "SYMBOL": ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"], # Provide a list for dropdown
         "QTY": int,
         "ENTRY_TIME": "time",
         "EXIT_TIME": "time"
