@@ -8,11 +8,11 @@ app.secret_key = 'super_secret_key_for_flash_messages'
 
 CONFIG_FILE_PATH = os.path.join(os.path.dirname(__file__), 'config.py')
 
-# Define the parameters and their expected types for validation
+# Define the parameters, their types, and options for validation and rendering
 CONFIG_SCHEMA = {
     "Trading Parameters": {
         "PAPER_TRADING": bool,
-        "SYMBOL": str,
+        "SYMBOL": ["NIFTY", "BANKNIFTY", "FINNIFTY"],
         "QTY": int,
         "ENTRY_TIME": "time",
         "EXIT_TIME": "time"
@@ -35,15 +35,11 @@ CONFIG_SCHEMA = {
 }
 
 def validate_form_data(form_data):
-    """
-    Validates the submitted form data against the CONFIG_SCHEMA.
-    Returns True if valid, False otherwise. Flashes error messages.
-    """
     is_valid = True
     for group, params in CONFIG_SCHEMA.items():
         for key, expected_type in params.items():
             if key not in form_data:
-                continue # Should not happen with a proper form
+                continue
 
             value = form_data[key]
 
@@ -58,13 +54,12 @@ def validate_form_data(form_data):
                 elif expected_type == "time":
                     if not re.match(r'^\d{2}:\d{2}$', value):
                         raise ValueError("Invalid time format")
-                elif isinstance(expected_type, list): # For dropdowns
+                elif isinstance(expected_type, list):
                     if value not in expected_type:
                         raise ValueError("Invalid option selected")
             except ValueError:
                 is_valid = False
-                flash(f"Invalid value for '{key}'. Please provide a valid input (e.g., a number, True/False, or HH:MM format).", "danger")
-                # Stop after first error to avoid spamming messages
+                flash(f"Invalid value for '{key}'. Please provide a valid input.", "danger")
                 return False
     return is_valid
 
@@ -78,20 +73,16 @@ def get_config_values():
                 pattern = re.compile(rf"^{key}\s*=\s*(.*)", re.MULTILINE)
                 match = pattern.search(content)
                 if match:
-                    # Use ast.literal_eval to safely parse Python literals (strings, numbers, booleans)
                     try:
-                        val = ast.literal_eval(match.group(1).strip())
+                        val_str = match.group(1).split('#')[0].strip()
+                        val = ast.literal_eval(val_str)
                         config_values[key] = val
                     except (ValueError, SyntaxError):
-                         # Fallback for simple string stripping if literal_eval fails
-                        config_values[key] = match.group(1).strip().strip("'\"")
-
+                        config_values[key] = match.group(1).split('#')[0].strip().strip("'\"")
     except Exception as e:
         flash(f"Error reading config file: {e}", "danger")
 
-    categorized_config = {group: {key: config_values.get(key, '') for key in keys} for group, keys in CONFIG_SCHEMA.items()}
-    return categorized_config
-
+    return {group: {key: config_values.get(key, '') for key in keys} for group, keys in CONFIG_SCHEMA.items()}
 
 def save_config_values(new_values):
     try:
@@ -100,17 +91,32 @@ def save_config_values(new_values):
 
         with open(CONFIG_FILE_PATH, 'w') as f:
             for line in lines:
-                match = re.match(r"^(\w+)\s*=", line)
+                content = line.strip()
+                if not content or content.startswith('#'):
+                    f.write(line)
+                    continue
+
+                match = re.match(r"^(\w+)\s*=", content)
                 if match:
                     key = match.group(1)
                     if key in new_values:
-                        # repr() is a great way to get the Python representation of an object
-                        # e.g., 'string' -> "'string'", 123 -> '123', True -> 'True'
-                        f.write(f'{key} = {repr(new_values[key])}\n')
+                        comment = ''
+                        if '#' in content:
+                            comment_part = content.split('#', 1)[1]
+                            comment = f'  # {comment_part.strip()}'
+
+                        value_to_save = new_values[key]
+                        # If the value is a float but has no decimal part, convert to int
+                        if isinstance(value_to_save, float) and value_to_save.is_integer():
+                            value_to_save = int(value_to_save)
+
+                        new_value_repr = repr(value_to_save)
+                        f.write(f'{key} = {new_value_repr}{comment}\n')
                     else:
                         f.write(line)
                 else:
                     f.write(line)
+
         flash("Configuration saved successfully!", "success")
     except Exception as e:
         flash(f"Error saving config file: {e}", "danger")
@@ -120,7 +126,6 @@ def index():
     if request.method == 'POST':
         form_data = request.form.to_dict()
         if validate_form_data(form_data):
-            # Convert form strings to correct Python types before saving
             typed_data = {}
             for key, value_str in form_data.items():
                 for params in CONFIG_SCHEMA.values():
@@ -133,18 +138,16 @@ def index():
                                 typed_data[key] = int(value_str)
                             elif expected_type == float:
                                 typed_data[key] = float(value_str)
-                            else: # Handles str, time, and list validation cases
+                            else:
                                 typed_data[key] = value_str
                         except ValueError:
-                            # This should already be caught by validate_form_data, but as a safeguard:
                             flash(f"Data type conversion failed for {key}. Aborting save.", "danger")
                             return redirect(url_for('index'))
             save_config_values(typed_data)
         return redirect(url_for('index'))
 
     config_data = get_config_values()
-    # Pass the isinstance function to the template context so it can be used for type checking
-    return render_template('index.html', categorized_config=config_data, schema=CONFIG_SCHEMA, isinstance=isinstance)
+    return render_template('index.html', categorized_config=config_data, schema=CONFIG_SCHEMA, isinstance=isinstance, list=list)
 
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
