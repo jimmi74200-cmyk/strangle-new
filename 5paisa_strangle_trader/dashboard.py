@@ -50,7 +50,11 @@ def validate_form_data(form_data):
                 elif expected_type == int:
                     int(value)
                 elif expected_type == float:
-                    float(value)
+                    num_value = float(value)
+                    # Add specific validation for OVERALL_SL
+                    if key == 'OVERALL_SL' and num_value > 0:
+                        flash("Invalid value for 'OVERALL_SL'. It must be a negative number or zero.", "danger")
+                        return False
                 elif expected_type == "time":
                     if not re.match(r'^\d{2}:\d{2}$', value):
                         raise ValueError("Invalid time format")
