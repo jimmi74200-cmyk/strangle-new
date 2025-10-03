@@ -9,9 +9,7 @@ import sys
 import websockets
 import asyncio
 import queue
-import re # Import the regular expression module
-
-# --- Re-used components from trader.py ---
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,6 +21,7 @@ action_queue = queue.Queue()
 entry_data = {}
 max_pnl = 0
 trailing_sl_activated = False
+current_trailing_sl = 0 # New global to track the TSL level
 ce_scrip_code = None
 pe_scrip_code = None
 realized_pnl = 0
@@ -48,7 +47,6 @@ class WebSocketManager:
                         while not self._subscription_queue.empty():
                             message = self._subscription_queue.get_nowait()
                             await websocket.send(json.dumps(message))
-                            logging.info(f"Sent message from queue: {message}")
                         message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                         self._on_message(message)
                     except asyncio.TimeoutError:
@@ -92,52 +90,47 @@ class WebSocketManager:
             "Method": "MarketFeedV3", "Operation": "Unsubscribe", "ClientCode": config.CLIENT_CODE, "MarketFeedData": scrips
         })
 
+def get_current_pnl():
+    """Calculates the current P&L for all active legs."""
+    if not trade_is_active: return 0
+    current_pnl = 0
+    if 'CE' in active_legs and ce_scrip_code in ltp_store:
+        current_pnl += (entry_data[ce_scrip_code]['entry_price'] - ltp_store[ce_scrip_code]) * config.QTY
+    if 'PE' in active_legs and pe_scrip_code in ltp_store:
+        current_pnl += (entry_data[pe_scrip_code]['entry_price'] - ltp_store[pe_scrip_code]) * config.QTY
+    return current_pnl
+
 def check_trade_conditions():
-    global max_pnl, trailing_sl_activated
+    global max_pnl, trailing_sl_activated, current_trailing_sl
     if not trade_is_active: return
-
-    total_pnl = 0
-    if ce_scrip_code in entry_data:
-        ce_ltp = ltp_store.get(ce_scrip_code)
-        if ce_ltp:
-            total_pnl += (entry_data[ce_scrip_code]['entry_price'] - ce_ltp) * config.QTY
-
-    if pe_scrip_code in entry_data:
-        pe_ltp = ltp_store.get(pe_scrip_code)
-        if pe_ltp:
-            total_pnl += (entry_data[pe_scrip_code]['entry_price'] - pe_ltp) * config.QTY
+    total_pnl = get_current_pnl()
 
     if total_pnl <= config.OVERALL_SL: action_queue.put({'action': 'exit', 'reason': 'OVERALL_SL_HIT'})
     elif total_pnl >= config.OVERALL_TARGET: action_queue.put({'action': 'exit', 'reason': 'OVERALL_TARGET_HIT'})
     elif trailing_sl_activated:
         if total_pnl > max_pnl: max_pnl = total_pnl
         trailing_sl = (int(max_pnl / config.TRAILING_PROFIT_TRIGGER)) * config.TRAILING_PROFIT_LOCKIN
+        current_trailing_sl = trailing_sl
         if total_pnl < trailing_sl: action_queue.put({'action': 'exit', 'reason': 'TRAILING_SL_HIT'})
     elif not trailing_sl_activated and total_pnl >= config.TRAILING_PROFIT_TRIGGER:
         trailing_sl_activated = True
         max_pnl = total_pnl
-        logging.info("Trailing stop-loss activated.")
+        logging.info(f"Trailing stop-loss activated at P&L: {total_pnl:,.2f}")
 
 def exit_positions(reason="Unknown"):
     global trade_is_active
     if not trade_is_active: return
     logging.info(f"EXIT TRIGGERED: Exiting all positions due to: {reason}")
 
-    scrips_to_unsubscribe = [{"Exch": "N", "ExchType": "D", "ScripCode": sc} for sc in active_legs.values()]
-    if ws_manager and scrips_to_unsubscribe:
-        ws_manager.unsubscribe(scrips_to_unsubscribe)
+    if ws_manager and active_legs:
+        ws_manager.unsubscribe([{"Exch": "N", "ExchType": "D", "ScripCode": sc} for sc in active_legs.values()])
 
     if not config.PAPER_TRADING:
         logging.info("Searching for and cancelling pending SL orders for the position...")
         try:
             order_book = client.order_book()
             if order_book:
-                sl_orders_to_cancel = [
-                    o for o in order_book
-                    if o.get('ScripCode') in [ce_scrip_code, pe_scrip_code]
-                    and o.get('OrderStatus', '').strip() in ['Pending', 'Modified', 'Trigger Pending', 'Open']
-                    and float(o.get('SLTriggerRate', 0)) > 0
-                ]
+                sl_orders_to_cancel = [o for o in order_book if o.get('ScripCode') in [ce_scrip_code, pe_scrip_code] and o.get('OrderStatus', '').strip() in ['Pending', 'Modified', 'Trigger Pending', 'Open'] and float(o.get('SLTriggerRate', 0)) > 0]
                 for order in sl_orders_to_cancel:
                     order_id = order.get('BrokerOrderId')
                     logging.info(f"Found pending SL order {order_id}. Cancelling...")
@@ -157,10 +150,7 @@ def _place_order_with_retry(order_type, scrip_code, qty, lock, max_retries=3, re
     for i in range(max_retries):
         try:
             with lock:
-                order_result = client.place_order(
-                    OrderType=order_type, Exchange='N', ExchangeType='D',
-                    ScripCode=scrip_code, Qty=qty, Price=0, IsIntraday=True, **kwargs
-                )
+                order_result = client.place_order(OrderType=order_type, Exchange='N', ExchangeType='D', ScripCode=scrip_code, Qty=qty, Price=0, IsIntraday=True, **kwargs)
             if order_result and order_result.get('Status') == 0:
                 logging.info(f"Order for ScripCode {scrip_code} placed successfully.")
                 return order_result
@@ -174,7 +164,6 @@ def _place_order_with_retry(order_type, scrip_code, qty, lock, max_retries=3, re
     return None
 
 def adopt_open_positions():
-    """Scans for and adopts an existing open strangle position."""
     global trade_is_active, ce_scrip_code, pe_scrip_code, active_legs, entry_data
     logging.info("Scanning for existing open strangle positions...")
     try:
@@ -189,56 +178,49 @@ def adopt_open_positions():
 
         if ce_pos and pe_pos:
             logging.info("Found an existing strangle position. Adopting it now.")
-
             def get_strike_from_name(scrip_name):
-                # This regex finds the last number (integer or float) in the string, which is the strike price.
                 match = re.search(r'(\d+(\.\d+)?)$', scrip_name.strip())
-                if match:
-                    return float(match.group(1))
+                if match: return float(match.group(1))
                 return None
 
             ce_strike = get_strike_from_name(ce_pos['ScripName'])
             pe_strike = get_strike_from_name(pe_pos['ScripName'])
-
             if not ce_strike or not pe_strike:
                 logging.error("Could not parse strike price from ScripName for one or both legs.")
                 return False
 
             ce_scrip_code = ce_pos['ScripCode']
             pe_scrip_code = pe_pos['ScripCode']
-
             entry_data[ce_scrip_code] = {'strike': ce_strike, 'entry_price': ce_pos['SellAvgRate']}
             entry_data[pe_scrip_code] = {'strike': pe_strike, 'entry_price': pe_pos['SellAvgRate']}
-
             active_legs = {'CE': ce_scrip_code, 'PE': pe_scrip_code}
             trade_is_active = True
 
             logging.info(f"Adopted CE leg: {ce_pos['ScripName']} @ {ce_pos['SellAvgRate']}")
             logging.info(f"Adopted PE leg: {pe_pos['ScripName']} @ {pe_pos['SellAvgRate']}")
-
-            ws_manager.subscribe([
-                {"Exch": "N", "ExchType": "D", "ScripCode": ce_scrip_code},
-                {"Exch": "N", "ExchType": "D", "ScripCode": pe_scrip_code}
-            ])
+            ws_manager.subscribe([{"Exch": "N", "ExchType": "D", "ScripCode": ce_scrip_code}, {"Exch": "N", "ExchType": "D", "ScripCode": pe_scrip_code}])
             logging.info("Subscribed to market data for the adopted position.")
             return True
         else:
             logging.info("Could not find a valid strangle position (one short CE and one short PE).")
             return False
-
     except Exception as e:
         logging.error(f"An error occurred while scanning for positions: {e}")
         return False
 
-# --- Main Execution Block ---
+def log_pnl_status():
+    """Calculates and logs the current P&L and TSL status."""
+    if not trade_is_active: return
+    current_pnl = get_current_pnl()
+    if trailing_sl_activated:
+        logging.info(f"P&L: {current_pnl:,.2f} | Max P&L: {max_pnl:,.2f} | Trailing SL: {current_trailing_sl:,.2f}")
+    else:
+        logging.info(f"P&L: {current_pnl:,.2f}")
+
 if __name__ == "__main__":
     logging.info("--- Starting Exit Manager Script ---")
 
-    client = FivePaisaClient(cred={
-        "APP_NAME": config.APP_NAME, "APP_SOURCE": config.APP_SOURCE,
-        "USER_ID": config.USER_ID, "PASSWORD": config.PASSWORD,
-        "USER_KEY": config.USER_KEY, "ENCRYPTION_KEY": config.ENCRYPTION_KEY
-    })
+    client = FivePaisaClient(cred={"APP_NAME": config.APP_NAME, "APP_SOURCE": config.APP_SOURCE, "USER_ID": config.USER_ID, "PASSWORD": config.PASSWORD, "USER_KEY": config.USER_KEY, "ENCRYPTION_KEY": config.ENCRYPTION_KEY})
     client.set_access_token(config.ACCESS_TOKEN, config.CLIENT_CODE)
 
     ws_manager = WebSocketManager()
@@ -252,7 +234,11 @@ if __name__ == "__main__":
 
     if adopt_open_positions():
         logging.info("Position adopted successfully. Entering monitoring mode.")
+        last_pnl_log_time = time.time()
         while trade_is_active:
+            if time.time() - last_pnl_log_time > 10:
+                log_pnl_status()
+                last_pnl_log_time = time.time()
             try:
                 action = action_queue.get_nowait()
                 if action.get('action') == 'exit':
