@@ -9,6 +9,7 @@ import sys
 import websockets
 import asyncio
 import queue
+import re # Import the regular expression module
 
 # --- Re-used components from trader.py ---
 
@@ -16,7 +17,6 @@ import queue
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Global State ---
-# Initialize with default values, they will be populated by the position scan
 client = None
 ltp_store = {}
 action_queue = queue.Queue()
@@ -128,8 +128,6 @@ def exit_positions(reason="Unknown"):
         ws_manager.unsubscribe(scrips_to_unsubscribe)
 
     if not config.PAPER_TRADING:
-        # Since this script adopts a position, it doesn't know the SL order IDs.
-        # We must find and cancel them first.
         logging.info("Searching for and cancelling pending SL orders for the position...")
         try:
             order_book = client.order_book()
@@ -147,17 +145,15 @@ def exit_positions(reason="Unknown"):
         except Exception as e:
             logging.error(f"An error occurred while trying to cancel SL orders: {e}")
 
-        # Now, square off the positions
         exit_lock = threading.Lock()
         for leg_type, scrip_code in list(active_legs.items()):
             logging.info(f"Placing market order to square off {leg_type} leg (ScripCode: {scrip_code}).")
             _place_order_with_retry('B', scrip_code, config.QTY, lock=exit_lock, max_retries=5)
 
     logging.info("All exit orders placed. Position is now closed.")
-    trade_is_active = False # Set to false to stop the monitoring loop
+    trade_is_active = False
 
 def _place_order_with_retry(order_type, scrip_code, qty, lock, max_retries=3, retry_delay=5, **kwargs):
-    """A thread-safe function to place an order with retries."""
     for i in range(max_retries):
         try:
             with lock:
@@ -187,22 +183,32 @@ def adopt_open_positions():
             logging.info("No open positions found.")
             return False
 
-        # Find short positions for the configured symbol
         symbol_positions = [p for p in positions if config.SYMBOL in p.get('ScripName', '') and p.get('NetQty', 0) < 0]
-
-        # Correctly identify CE and PE legs by searching within the ScripName
         ce_pos = next((p for p in symbol_positions if " CE " in p.get('ScripName', '')), None)
         pe_pos = next((p for p in symbol_positions if " PE " in p.get('ScripName', '')), None)
 
         if ce_pos and pe_pos:
             logging.info("Found an existing strangle position. Adopting it now.")
 
-            # Rebuild state from the position data
+            def get_strike_from_name(scrip_name):
+                # This regex finds the last number (integer or float) in the string, which is the strike price.
+                match = re.search(r'(\d+(\.\d+)?)$', scrip_name.strip())
+                if match:
+                    return float(match.group(1))
+                return None
+
+            ce_strike = get_strike_from_name(ce_pos['ScripName'])
+            pe_strike = get_strike_from_name(pe_pos['ScripName'])
+
+            if not ce_strike or not pe_strike:
+                logging.error("Could not parse strike price from ScripName for one or both legs.")
+                return False
+
             ce_scrip_code = ce_pos['ScripCode']
             pe_scrip_code = pe_pos['ScripCode']
 
-            entry_data[ce_scrip_code] = {'strike': ce_pos['StrikeRate'], 'entry_price': ce_pos['SellAvgRate']}
-            entry_data[pe_scrip_code] = {'strike': pe_pos['StrikeRate'], 'entry_price': pe_pos['SellAvgRate']}
+            entry_data[ce_scrip_code] = {'strike': ce_strike, 'entry_price': ce_pos['SellAvgRate']}
+            entry_data[pe_scrip_code] = {'strike': pe_strike, 'entry_price': pe_pos['SellAvgRate']}
 
             active_legs = {'CE': ce_scrip_code, 'PE': pe_scrip_code}
             trade_is_active = True
@@ -210,7 +216,6 @@ def adopt_open_positions():
             logging.info(f"Adopted CE leg: {ce_pos['ScripName']} @ {ce_pos['SellAvgRate']}")
             logging.info(f"Adopted PE leg: {pe_pos['ScripName']} @ {pe_pos['SellAvgRate']}")
 
-            # Subscribe to WebSocket for live prices
             ws_manager.subscribe([
                 {"Exch": "N", "ExchType": "D", "ScripCode": ce_scrip_code},
                 {"Exch": "N", "ExchType": "D", "ScripCode": pe_scrip_code}
@@ -239,16 +244,14 @@ if __name__ == "__main__":
     ws_manager = WebSocketManager()
     ws_manager.start()
     logging.info("Waiting for websocket to connect...")
-    time.sleep(5) # Give time for websocket to establish connection
+    time.sleep(5)
 
     if not ws_manager.is_connected:
         logging.critical("WebSocket connection failed. Cannot proceed.")
         sys.exit(1)
 
-    # Try to find and adopt an open position
     if adopt_open_positions():
         logging.info("Position adopted successfully. Entering monitoring mode.")
-        # Main monitoring loop
         while trade_is_active:
             try:
                 action = action_queue.get_nowait()
@@ -262,7 +265,6 @@ if __name__ == "__main__":
         logging.info("No active strangle position to manage. Exiting script.")
 
     logging.info("--- Exit Manager Script Finished ---")
-    # Stop the websocket thread gracefully
     if ws_manager:
         ws_manager.is_connected = False
     sys.exit(0)
