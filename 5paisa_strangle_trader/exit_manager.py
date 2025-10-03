@@ -188,10 +188,11 @@ def adopt_open_positions():
             return False
 
         # Find short positions for the configured symbol
-        symbol_positions = [p for p in positions if config.SYMBOL in p.get('ScripName', '') and p.get('NetQty') < 0]
+        symbol_positions = [p for p in positions if config.SYMBOL in p.get('ScripName', '') and p.get('NetQty', 0) < 0]
 
-        ce_pos = next((p for p in symbol_positions if p.get('OptType') == 'CE'), None)
-        pe_pos = next((p for p in symbol_positions if p.get('OptType') == 'PE'), None)
+        # Correctly identify CE and PE legs by searching within the ScripName
+        ce_pos = next((p for p in symbol_positions if " CE " in p.get('ScripName', '')), None)
+        pe_pos = next((p for p in symbol_positions if " PE " in p.get('ScripName', '')), None)
 
         if ce_pos and pe_pos:
             logging.info("Found an existing strangle position. Adopting it now.")
