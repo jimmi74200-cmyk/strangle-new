@@ -35,12 +35,13 @@ pending_sl_order_ids = []
 entry_data = {}
 max_pnl = 0
 trailing_sl_activated = False
+current_trailing_sl = 0
 ce_scrip_code = None
 pe_scrip_code = None
 realized_pnl = 0
 trade_is_active = False
 ws_manager = None
-active_legs = {} # To track which legs are currently open
+active_legs = {}
 
 # --- WebSocket Manager ---
 class WebSocketManager:
@@ -69,19 +70,16 @@ class WebSocketManager:
                 initial_sub_msg = self._get_initial_subscription_msg()
                 if initial_sub_msg:
                     await websocket.send(initial_sub_msg)
-                    logging.info(f"Sent initial subscription for {config.SYMBOL}")
                 while self.is_connected:
                     try:
                         while not self._subscription_queue.empty():
                             message = self._subscription_queue.get_nowait()
                             await websocket.send(json.dumps(message))
-                            logging.info(f"Sent message from queue: {message}")
                         message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                         self._on_message(message)
                     except asyncio.TimeoutError:
                         continue
                     except websockets.exceptions.ConnectionClosed:
-                        logging.warning("WebSocket connection closed.")
                         break
                     except Exception as e:
                         logging.error(f"Error in websocket run loop: {e}")
@@ -90,16 +88,14 @@ class WebSocketManager:
             logging.error(f"Failed to connect to websocket: {e}")
         finally:
             self.is_connected = False
-            logging.info("WebSocket run loop finished.")
 
     def _on_message(self, message):
         try:
             data_list = json.loads(message)
             for data in data_list:
                 if "Token" in data and "LastRate" in data:
-                    scrip_code = data["Token"]
-                    ltp_store[scrip_code] = data["LastRate"]
-                    if trade_is_active and scrip_code in [ce_scrip_code, pe_scrip_code]:
+                    ltp_store[data["Token"]] = data["LastRate"]
+                    if trade_is_active and data["Token"] in [ce_scrip_code, pe_scrip_code]:
                         check_trade_conditions()
         except Exception as e:
             logging.error(f"Error parsing websocket message: {message} - {e}")
@@ -110,34 +106,19 @@ class WebSocketManager:
         self._thread.start()
 
     def subscribe(self, scrips):
-        self._subscription_queue.put({
-            "Method": "MarketFeedV3", "Operation": "Subscribe", "ClientCode": config.CLIENT_CODE, "MarketFeedData": scrips
-        })
+        self._subscription_queue.put({"Method": "MarketFeedV3", "Operation": "Subscribe", "ClientCode": config.CLIENT_CODE, "MarketFeedData": scrips})
 
     def unsubscribe(self, scrips):
-        self._subscription_queue.put({
-            "Method": "MarketFeedV3", "Operation": "Unsubscribe", "ClientCode": config.CLIENT_CODE, "MarketFeedData": scrips
-        })
+        self._subscription_queue.put({"Method": "MarketFeedV3", "Operation": "Unsubscribe", "ClientCode": config.CLIENT_CODE, "MarketFeedData": scrips})
 
-# --- Data and Trading Logic ---
-
+# --- Trading Logic ---
 def get_nearest_weekly_expiry(symbol):
     try:
         expiry_dates = client.get_expiry("N", symbol)
-        if not expiry_dates or 'Expiry' not in expiry_dates:
-            logging.error("Could not fetch expiry dates.")
-            return None
+        if not expiry_dates or 'Expiry' not in expiry_dates: return None
         today = datetime.date.today()
-        nearest_expiry = None
-        min_diff = float('inf')
-        for expiry in expiry_dates['Expiry']:
-            timestamp_str = re.search(r'\d+', expiry['ExpiryDate']).group(0)
-            expiry_date = datetime.datetime.fromtimestamp(int(timestamp_str) / 1000).date()
-            diff = (expiry_date - today).days
-            if 0 <= diff < min_diff:
-                min_diff = diff
-                nearest_expiry = int(timestamp_str)
-        return nearest_expiry
+        nearest_expiry = min((d for d in expiry_dates['Expiry'] if (datetime.datetime.fromtimestamp(int(re.search(r'\d+', d['ExpiryDate']).group(0)) / 1000).date() - today).days >= 0), key=lambda d: (datetime.datetime.fromtimestamp(int(re.search(r'\d+', d['ExpiryDate']).group(0)) / 1000).date() - today).days)
+        return int(re.search(r'\d+', nearest_expiry['ExpiryDate']).group(0))
     except Exception as e:
         logging.error(f"Error getting nearest weekly expiry: {e}")
         return None
@@ -145,419 +126,282 @@ def get_nearest_weekly_expiry(symbol):
 def get_option_chain(symbol, expiry_date):
     try:
         option_chain = client.get_option_chain("N", symbol, expiry_date)
-        if not option_chain or 'Options' not in option_chain or not option_chain['Options']:
-            logging.error("Could not fetch option chain or it was empty. API Response: %s", option_chain)
-            return None
-        return option_chain['Options']
+        return option_chain.get('Options')
     except Exception as e:
         logging.error(f"Error getting option chain: {e}")
         return None
 
 def get_scrip_from_local_file(symbol):
     try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(script_dir, 'scrip_data.json')
-        with open(file_path, 'r') as f:
-            scrip_data = json.load(f)
-        return scrip_data.get(symbol)
+        with open(os.path.join(os.path.dirname(__file__), 'scrip_data.json'), 'r') as f:
+            return json.load(f).get(symbol)
     except Exception as e:
         logging.error(f"Error reading scrip_data.json: {e}")
         return None
 
 def get_spot_price(symbol):
-    try:
-        scrip_info = get_scrip_from_local_file(symbol)
-        if not scrip_info: return None
-        scrip_code = scrip_info["ScripCode"]
-        timeout = 10
-        start_time = time.time()
-        while scrip_code not in ltp_store:
-            if time.time() - start_time > timeout:
-                logging.error(f"Timed out waiting for spot price for {symbol} (ScripCode: {scrip_code}).")
-                return None
-            time.sleep(0.1)
-        return ltp_store[scrip_code]
-    except Exception as e:
-        logging.error(f"An error occurred while getting the spot price for {symbol}: {e}")
-        return None
+    scrip_info = get_scrip_from_local_file(symbol)
+    if not scrip_info: return None
+    scrip_code = scrip_info["ScripCode"]
+    timeout = 10
+    start_time = time.time()
+    while scrip_code not in ltp_store:
+        if time.time() - start_time > timeout:
+            logging.error(f"Timed out waiting for spot price for {symbol}.")
+            return None
+        time.sleep(0.1)
+    return ltp_store[scrip_code]
 
-def get_atm_strike(spot_price, strikes):
-    return min(strikes, key=lambda x: abs(x - spot_price))
+def select_strikes(option_chain, spot_price):
+    strikes = sorted(list(set([o['StrikeRate'] for o in option_chain])))
+    atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
 
-def get_strike_interval(strikes, atm_strike):
-    try:
-        atm_index = strikes.index(atm_strike)
-        if atm_index + 1 < len(strikes):
-            return strikes[atm_index + 1] - strikes[atm_index]
-        elif atm_index > 0:
-            return strikes[atm_index] - strikes[atm_index - 1]
-    except ValueError:
-        pass
-    if len(strikes) > 1:
-        return strikes[1] - strikes[0]
-    logging.warning("Could not determine strike interval. Falling back to default 50.")
-    return 50
+    method = config.STRIKE_SELECTION_METHOD
+    if method == "ATM":
+        return atm_strike, atm_strike
 
-def get_otm_strikes(atm_strike, strikes, distance):
-    strike_diff = get_strike_interval(strikes, atm_strike)
-    ce_strike = atm_strike + (distance * strike_diff)
-    pe_strike = atm_strike - (distance * strike_diff)
-    return ce_strike, pe_strike
+    strike_interval = strikes[1] - strikes[0] if len(strikes) > 1 else 50
 
-def get_itm_strikes(atm_strike, strikes, distance):
-    strike_diff = get_strike_interval(strikes, atm_strike)
-    ce_strike = atm_strike - (distance * strike_diff)
-    pe_strike = atm_strike + (distance * strike_diff)
-    return ce_strike, pe_strike
+    if method == "OTM":
+        return atm_strike + (config.STRANGLE_STRIKE_DISTANCE * strike_interval), atm_strike - (config.STRANGLE_STRIKE_DISTANCE * strike_interval)
+    if method == "ITM":
+        return atm_strike - (config.STRANGLE_STRIKE_DISTANCE * strike_interval), atm_strike + (config.STRANGLE_STRIKE_DISTANCE * strike_interval)
 
-def select_strikes(option_chain, method, premium, spot_price):
     if method == "NEAREST_PREMIUM":
+        ce_strikes = {o['StrikeRate']: o['LastRate'] for o in option_chain if o['CPType'] == 'CE' and o['StrikeRate'] >= atm_strike}
+        pe_strikes = {o['StrikeRate']: o['LastRate'] for o in option_chain if o['CPType'] == 'PE' and o['StrikeRate'] <= atm_strike}
+        if not ce_strikes or not pe_strikes: return None, None
+        ce_closest = min(ce_strikes.items(), key=lambda x: abs(x[1] - config.PREMIUM))
+        pe_closest = min(pe_strikes.items(), key=lambda x: abs(x[1] - config.PREMIUM))
+        return ce_closest[0], pe_closest[0]
+
+    if method == "EQUAL_PREMIUM_GAP":
+        options = {o['StrikeRate']: o for o in option_chain}
+        valid_pairs = []
+        for i in range(-5, 6):
+            pe_strike = atm_strike + (i * strike_interval)
+            ce_strike = pe_strike + config.STRANGLE_GAP_POINTS
+            if ce_strike in options and pe_strike in options and options[ce_strike]['CPType'] == 'CE' and options[pe_strike]['CPType'] == 'PE':
+                premium_diff = abs(options[ce_strike]['LastRate'] - options[pe_strike]['LastRate'])
+                valid_pairs.append(((ce_strike, pe_strike), premium_diff))
+        if not valid_pairs: return None, None
+        return min(valid_pairs, key=lambda x: x[1])[0]
+
+    return None, None
+
+def _place_order_with_retry(order_type, scrip_code, qty, lock, **kwargs):
+    for i in range(3):
         try:
-            ce_strikes = {o['StrikeRate']: o['LastRate'] for o in option_chain if o['CPType'] == 'CE'}
-            pe_strikes = {o['StrikeRate']: o['LastRate'] for o in option_chain if o['CPType'] == 'PE'}
-            if not ce_strikes or not pe_strikes:
-                logging.error("Could not find CE or PE strikes in option chain.")
-                return None, None
-            ce_closest_premium = min(ce_strikes.items(), key=lambda x: abs(x[1] - premium))
-            pe_closest_premium = min(pe_strikes.items(), key=lambda x: abs(x[1] - premium))
-            return ce_closest_premium[0], pe_closest_premium[0]
+            with lock:
+                order_result = client.place_order(OrderType=order_type, Exchange='N', ExchangeType='D', ScripCode=scrip_code, Qty=qty, Price=0, IsIntraday=True, **kwargs)
+            if order_result and order_result.get('Status') == 0:
+                return order_result
+            logging.warning(f"Order failed for {scrip_code}: {order_result.get('Message')}. Retry {i+1}/3.")
+            time.sleep(5)
         except Exception as e:
-            logging.error(f"Error selecting strikes by nearest premium: {e}")
-            return None, None
-    elif method == "EQUAL_PREMIUM_GAP":
-        try:
-            strikes = sorted(list(set([o['StrikeRate'] for o in option_chain])))
-            if len(strikes) < 2:
-                logging.error("Not enough strikes in option chain to determine interval.")
-                return None, None
-            atm_strike = get_atm_strike(spot_price, strikes)
-            strike_interval = get_strike_interval(strikes, atm_strike)
-            ce_options = {o['StrikeRate']: o['LastRate'] for o in option_chain if o['CPType'] == 'CE'}
-            pe_options = {o['StrikeRate']: o['LastRate'] for o in option_chain if o['CPType'] == 'PE'}
-            valid_pairs = []
-            for i in range(-5, 6):
-                put_strike_candidate = atm_strike + (i * strike_interval)
-                call_strike_candidate = put_strike_candidate + config.STRANGLE_GAP_POINTS
-                if call_strike_candidate in ce_options and put_strike_candidate in pe_options:
-                    ce_premium = ce_options[call_strike_candidate]
-                    pe_premium = pe_options[put_strike_candidate]
-                    premium_diff = abs(ce_premium - pe_premium)
-                    valid_pairs.append(((call_strike_candidate, put_strike_candidate), premium_diff))
-            if not valid_pairs:
-                logging.error("No valid pairs found for the given gap around the ATM.")
-                return None, None
-            best_pair = min(valid_pairs, key=lambda x: x[1])
-            return best_pair[0]
-        except Exception as e:
-            logging.error(f"Error selecting strikes by equal premium gap: {e}")
-            return None, None
-    else:
-        strikes = sorted(list(set([o['StrikeRate'] for o in option_chain])))
-        atm_strike = get_atm_strike(spot_price, strikes)
-        if method == "ATM":
-            return atm_strike, atm_strike
-        elif method == "OTM":
-            return get_otm_strikes(atm_strike, strikes, config.STRANGLE_STRIKE_DISTANCE)
-        elif method == "ITM":
-            return get_itm_strikes(atm_strike, strikes, config.STRANGLE_STRIKE_DISTANCE)
-        else:
-            logging.error(f"Invalid strike selection method: {method}")
-            return None, None
+            logging.error(f"Exception placing order for {scrip_code}: {e}. Retry {i+1}/3.")
+            time.sleep(5)
+    return None
 
 def place_strangle_order():
-    global pending_sl_order_ids, entry_data, ce_scrip_code, pe_scrip_code, trade_is_active, active_legs
-    if trade_is_active:
-        logging.warning("A trade is already active. Skipping new order placement.")
-        return
+    global trade_is_active, ce_scrip_code, pe_scrip_code, entry_data, active_legs, pending_sl_order_ids
+    if trade_is_active: return
     logging.info("Attempting to place strangle order...")
+
     nearest_expiry = get_nearest_weekly_expiry(config.SYMBOL)
     if not nearest_expiry: return
+
     option_chain = get_option_chain(config.SYMBOL, nearest_expiry)
     if not option_chain: return
+
     spot_price = get_spot_price(config.SYMBOL)
     if not spot_price: return
 
-    logging.info(f"Current {config.SYMBOL} spot price: {spot_price}")
-    ce_strike, pe_strike = select_strikes(option_chain, config.STRIKE_SELECTION_METHOD, config.PREMIUM, spot_price)
-
-    if ce_strike and pe_strike:
-        logging.info(f"Selected CE strike: {ce_strike}, PE strike: {pe_strike}")
-        ce_scrip_code = next((o['ScripCode'] for o in option_chain if o['StrikeRate'] == ce_strike and o['CPType'] == 'CE'), None)
-        pe_scrip_code = next((o['ScripCode'] for o in option_chain if o['StrikeRate'] == pe_strike and o['CPType'] == 'PE'), None)
-
-        if ce_scrip_code and pe_scrip_code:
-            if config.PAPER_TRADING:
-                logging.info(f"[PAPER TRADE] Getting live prices for {ce_strike} CE and {pe_strike} PE to simulate entry.")
-                # Subscribe to get the live prices
-                ws_manager.subscribe([
-                    {"Exch": "N", "ExchType": "D", "ScripCode": ce_scrip_code},
-                    {"Exch": "N", "ExchType": "D", "ScripCode": pe_scrip_code}
-                ])
-                # Wait for prices to arrive
-                time.sleep(2) # Brief wait for websocket feed
-
-                ce_entry_price = ltp_store.get(ce_scrip_code)
-                pe_entry_price = ltp_store.get(pe_scrip_code)
-
-                if ce_entry_price and pe_entry_price:
-                    logging.info(f"[PAPER TRADE] Simulating SELL order at CE Price: {ce_entry_price}, PE Price: {pe_entry_price}")
-                    entry_data[ce_scrip_code] = {'strike': ce_strike, 'entry_price': ce_entry_price}
-                    entry_data[pe_scrip_code] = {'strike': pe_strike, 'entry_price': pe_entry_price}
-                    active_legs = {'CE': ce_scrip_code, 'PE': pe_scrip_code}
-                    trade_is_active = True
-                    logging.info("Paper trade is now active.")
-                else:
-                    logging.error("Could not fetch live prices for paper trade entry. Halting strategy.")
-            else:
-                # Place initial orders
-                ce_order_result = client.place_order(OrderType='S', Exchange='N', ExchangeType='D', ScripCode=ce_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-                pe_order_result = client.place_order(OrderType='S', Exchange='N', ExchangeType='D', ScripCode=pe_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-
-                ce_broker_id = ce_order_result.get('BrokerOrderID') if ce_order_result else None
-                pe_broker_id = pe_order_result.get('BrokerOrderID') if pe_order_result else None
-                logging.info(f"Strangle orders placed. CE Broker ID: {ce_broker_id}, PE Broker ID: {pe_broker_id}. Waiting for execution...")
-
-                # --- Final Position-First Confirmation Loop ---
-                for i in range(12): # 60 seconds timeout
-                    positions = client.positions()
-                    ce_pos = next((p for p in positions if p['ScripCode'] == ce_scrip_code), None) if positions else None
-                    pe_pos = next((p for p in positions if p['ScripCode'] == pe_scrip_code), None) if positions else None
-
-                    if ce_pos and pe_pos:
-                        logging.info("Both legs confirmed in positions.")
-                        entry_data[ce_scrip_code] = {'strike': ce_strike, 'entry_price': ce_pos['SellAvgRate']}
-                        sl_price_ce = ce_pos['SellAvgRate'] + config.LEG_WISE_SL_POINTS
-                        limit_price_ce = sl_price_ce + config.SL_LIMIT_BUFFER
-                        client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=ce_scrip_code, Qty=abs(ce_pos['NetQty']), Price=limit_price_ce, StopLossPrice=sl_price_ce, IsIntraday=True)
-
-                        entry_data[pe_scrip_code] = {'strike': pe_strike, 'entry_price': pe_pos['SellAvgRate']}
-                        sl_price_pe = pe_pos['SellAvgRate'] + config.LEG_WISE_SL_POINTS
-                        limit_price_pe = sl_price_pe + config.SL_LIMIT_BUFFER
-                        client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=pe_scrip_code, Qty=abs(pe_pos['NetQty']), Price=limit_price_pe, StopLossPrice=sl_price_pe, IsIntraday=True)
-
-                        ws_manager.subscribe([
-                            {"Exch": "N", "ExchType": "D", "ScripCode": ce_scrip_code},
-                            {"Exch": "N", "ExchType": "D", "ScripCode": pe_scrip_code}
-                        ])
-                        active_legs = {'CE': ce_scrip_code, 'PE': pe_scrip_code}
-                        trade_is_active = True
-                        logging.info("Trade is now active.")
-                        return
-
-                    # If a leg is missing, check the order book for a potential rejection
-                    if i > 1: # Start checking order book only after a couple of seconds
-                        order_book = client.order_book()
-                        if not ce_pos:
-                            ce_order = next((o for o in order_book if str(o.get('BrokerOrderId')) == str(ce_broker_id)), None) if ce_broker_id and order_book else None
-                            if ce_order and ce_order.get('OrderStatus') in ['Rejected', 'Cancelled']:
-                                reason = ce_order.get('Reason', '')
-                                if "closed" in reason:
-                                    logging.critical(f"CE order rejected because market is closed. Reason: {reason}. Halting strategy.")
-                                    return
-                                logging.warning(f"CE order {ce_broker_id} was {ce_order.get('OrderStatus')}. Reason: {reason}. Retrying...")
-                                ce_order_result = client.place_order(OrderType='S', Exchange='N', ExchangeType='D', ScripCode=ce_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-                                ce_broker_id = ce_order_result.get('BrokerOrderId') if ce_order_result and ce_order_result.get('Status') == 0 else None
-
-                        if not pe_pos:
-                            pe_order = next((o for o in order_book if str(o.get('BrokerOrderId')) == str(pe_broker_id)), None) if pe_broker_id and order_book else None
-                            if pe_order and pe_order.get('OrderStatus') in ['Rejected', 'Cancelled']:
-                                reason = pe_order.get('Reason', '')
-                                if "closed" in reason:
-                                    logging.critical(f"PE order rejected because market is closed. Reason: {reason}. Halting strategy.")
-                                    return
-                                logging.warning(f"PE order {pe_broker_id} was {pe_order.get('OrderStatus')}. Reason: {reason}. Retrying...")
-                                pe_order_result = client.place_order(OrderType='S', Exchange='N', ExchangeType='D', ScripCode=pe_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-                                pe_broker_id = pe_order_result.get('BrokerOrderId') if pe_order_result and pe_order_result.get('Status') == 0 else None
-
-                    logging.info(f"Waiting for position confirmation... ({i+1}/12)")
-                    time.sleep(5)
-
-                logging.critical("CRITICAL ERROR: Failed to confirm execution of both legs after 60s.")
-                positions = client.positions()
-                ce_pos = any(p['ScripCode'] == ce_scrip_code for p in positions)
-                pe_pos = any(p['ScripCode'] == pe_scrip_code for p in positions)
-                if ce_pos and not pe_pos:
-                    logging.critical("PE leg failed. Squaring off naked CE position.")
-                    client.squareoff('N', 'D', ce_scrip_code)
-                elif not ce_pos and pe_pos:
-                    logging.critical("CE leg failed. Squaring off naked PE position.")
-                    client.squareoff('N', 'D', pe_scrip_code)
-                else:
-                    logging.error("Neither leg seems to have executed. Manual check required.")
-        else:
-            logging.error("Could not find scrip codes for selected strikes.")
-    else:
+    ce_strike, pe_strike = select_strikes(option_chain, spot_price)
+    if not ce_strike or not pe_strike:
         logging.error("Could not select strikes.")
-
-def check_trade_conditions():
-    global max_pnl, trailing_sl_activated
-
-    total_pnl = realized_pnl
-
-    # Calculate PNL only for active legs
-    if 'CE' in active_legs:
-        ce_ltp = ltp_store.get(ce_scrip_code)
-        if ce_ltp:
-            total_pnl += (entry_data[ce_scrip_code]['entry_price'] - ce_ltp) * config.QTY
-
-    if 'PE' in active_legs:
-        pe_ltp = ltp_store.get(pe_scrip_code)
-        if pe_ltp:
-            total_pnl += (entry_data[pe_scrip_code]['entry_price'] - pe_ltp) * config.QTY
-
-    if not active_legs: # If both legs have been closed individually
-        logging.info("Both legs have been closed. Finalizing trade.")
-        action_queue.put({'action': 'exit', 'reason': 'BOTH_LEGS_CLOSED'})
         return
 
-    if total_pnl <= config.OVERALL_SL: action_queue.put({'action': 'exit', 'reason': 'OVERALL_SL_HIT'})
-    elif total_pnl >= config.OVERALL_TARGET: action_queue.put({'action': 'exit', 'reason': 'OVERALL_TARGET_HIT'})
+    ce_scrip_code = next((o['ScripCode'] for o in option_chain if o['StrikeRate'] == ce_strike and o['CPType'] == 'CE'), None)
+    pe_scrip_code = next((o['ScripCode'] for o in option_chain if o['StrikeRate'] == pe_strike and o['CPType'] == 'PE'), None)
+
+    if not ce_scrip_code or not pe_scrip_code:
+        logging.error("Could not find scrip codes for selected strikes.")
+        return
+
+    if config.PAPER_TRADING:
+        trade_is_active = True
+        active_legs = {'CE': ce_scrip_code, 'PE': pe_scrip_code}
+        entry_data = {ce_scrip_code: {'strike': ce_strike, 'entry_price': 100}, pe_scrip_code: {'strike': pe_strike, 'entry_price': 100}}
+        logging.info("Paper trade is now active.")
+        return
+
+    results = {}
+    order_lock = threading.Lock()
+    def place_leg(leg_type, scrip):
+        results[leg_type] = _place_order_with_retry('S', scrip, config.QTY, lock=order_lock)
+
+    ce_thread = threading.Thread(target=place_leg, args=('CE', ce_scrip_code))
+    pe_thread = threading.Thread(target=place_leg, args=('PE', pe_scrip_code))
+    ce_thread.start()
+    pe_thread.start()
+    ce_thread.join()
+    pe_thread.join()
+
+    if results.get('CE') and results.get('PE'):
+        for i in range(12):
+            positions = client.positions()
+            ce_pos = next((p for p in (positions or []) if p['ScripCode'] == ce_scrip_code), None)
+            pe_pos = next((p for p in (positions or []) if p['ScripCode'] == pe_scrip_code), None)
+            if ce_pos and pe_pos:
+                entry_data = {ce_scrip_code: {'strike': ce_strike, 'entry_price': ce_pos['SellAvgRate']}, pe_scrip_code: {'strike': pe_strike, 'entry_price': pe_pos['SellAvgRate']}}
+                sl_ce_order = client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=ce_scrip_code, Qty=abs(ce_pos['NetQty']), Price=ce_pos['SellAvgRate'] + config.LEG_WISE_SL_POINTS + config.SL_LIMIT_BUFFER, StopLossPrice=ce_pos['SellAvgRate'] + config.LEG_WISE_SL_POINTS, IsIntraday=True)
+                if sl_ce_order.get('Status') == 0: pending_sl_order_ids.append(sl_ce_order.get('BrokerOrderID'))
+                sl_pe_order = client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=pe_scrip_code, Qty=abs(pe_pos['NetQty']), Price=pe_pos['SellAvgRate'] + config.LEG_WISE_SL_POINTS + config.SL_LIMIT_BUFFER, StopLossPrice=pe_pos['SellAvgRate'] + config.LEG_WISE_SL_POINTS, IsIntraday=True)
+                if sl_pe_order.get('Status') == 0: pending_sl_order_ids.append(sl_pe_order.get('BrokerOrderID'))
+                ws_manager.subscribe([{"Exch": "N", "ExchType": "D", "ScripCode": sc} for sc in [ce_scrip_code, pe_scrip_code]])
+                trade_is_active = True
+                active_legs = {'CE': ce_scrip_code, 'PE': pe_scrip_code}
+                logging.info(f"Trade is now active. CE@{entry_data[ce_scrip_code]['entry_price']:.2f}, PE@{entry_data[pe_scrip_code]['entry_price']:.2f}")
+                return
+            time.sleep(5)
+        logging.critical("Failed to confirm position execution. Exiting.")
+    else:
+        logging.critical("One or both legs failed to place. Squaring off if necessary.")
+        square_off_lock = threading.Lock()
+        if results.get('CE'): _place_order_with_retry('B', ce_scrip_code, config.QTY, lock=square_off_lock)
+        if results.get('PE'): _place_order_with_retry('B', pe_scrip_code, config.QTY, lock=square_off_lock)
+
+def get_current_pnl():
+    if not trade_is_active: return 0
+    pnl = realized_pnl
+    for leg, scrip in active_legs.items():
+        if scrip in ltp_store and scrip in entry_data:
+            pnl += (entry_data[scrip]['entry_price'] - ltp_store[scrip]) * config.QTY
+    return pnl
+
+def check_trade_conditions():
+    global max_pnl, trailing_sl_activated, current_trailing_sl
+    pnl = get_current_pnl()
+    if pnl <= config.OVERALL_SL or pnl >= config.OVERALL_TARGET:
+        reason = 'OVERALL_SL_HIT' if pnl <= config.OVERALL_SL else 'OVERALL_TARGET_HIT'
+        action_queue.put({'action': 'exit', 'reason': reason})
     elif trailing_sl_activated:
-        if total_pnl > max_pnl: max_pnl = total_pnl
-        trailing_sl = (int(max_pnl / config.TRAILING_PROFIT_TRIGGER)) * config.TRAILING_PROFIT_LOCKIN
-        if total_pnl < trailing_sl: action_queue.put({'action': 'exit', 'reason': 'TRAILING_SL_HIT'})
-    elif not trailing_sl_activated and total_pnl >= config.TRAILING_PROFIT_TRIGGER:
+        if pnl > max_pnl: max_pnl = pnl
+        # New "fixed drawdown" trailing stop-loss logic
+        tsl_level = max_pnl - config.TRAILING_PROFIT_LOCKIN
+        current_trailing_sl = tsl_level
+        if pnl < tsl_level: action_queue.put({'action': 'exit', 'reason': 'TRAILING_SL_HIT'})
+    elif pnl >= config.TRAILING_PROFIT_TRIGGER:
         trailing_sl_activated = True
-        logging.info("Trailing stop-loss activated.")
+        max_pnl = pnl
+        logging.info(f"Trailing SL activated at P&L: {pnl:,.2f}")
 
 def exit_positions(reason="Unknown"):
-    global pending_sl_order_ids, entry_data, realized_pnl, ce_scrip_code, pe_scrip_code, trade_is_active, max_pnl, trailing_sl_activated, active_legs
+    global trade_is_active, pending_sl_order_ids, entry_data, active_legs, realized_pnl, max_pnl, trailing_sl_activated, ce_scrip_code, pe_scrip_code, current_trailing_sl
     if not trade_is_active: return
-    logging.info(f"Exiting all positions due to: {reason}")
-    if ws_manager and ce_scrip_code and pe_scrip_code:
-        ws_manager.unsubscribe([
-            {"Exch": "N", "ExchType": "D", "ScripCode": ce_scrip_code},
-            {"Exch": "N", "ExchType": "D", "ScripCode": pe_scrip_code}
-        ])
-
-    ce_exit_price = ltp_store.get(ce_scrip_code, 0)
-    pe_exit_price = ltp_store.get(pe_scrip_code, 0)
+    logging.info(f"Exiting positions due to: {reason}")
+    if ws_manager and active_legs:
+        ws_manager.unsubscribe([{"Exch": "N", "ExchType": "D", "ScripCode": sc} for sc in active_legs.values()])
 
     if not config.PAPER_TRADING:
-        # First, cancel any pending SL orders to avoid them executing during our exit.
         for order_id in pending_sl_order_ids:
-            try:
-                client.cancel_order(order_id)
-                logging.info(f"Successfully cancelled pending SL order: {order_id}")
-            except Exception as e:
-                logging.error(f"Error cancelling SL order {order_id}: {e}")
-
-        # Now, explicitly square off each leg of our trade
-        logging.info("Placing explicit market orders to exit positions.")
-        if ce_scrip_code in entry_data:
-            try:
-                # To square off a short position, we place a buy order
-                client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=ce_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-                logging.info(f"Exit order placed for CE leg (ScripCode: {ce_scrip_code}).")
-            except Exception as e:
-                logging.error(f"Error placing exit order for CE leg: {e}")
-
-        if pe_scrip_code in entry_data:
-            try:
-                client.place_order(OrderType='B', Exchange='N', ExchangeType='D', ScripCode=pe_scrip_code, Qty=config.QTY, Price=0, IsIntraday=True)
-                logging.info(f"Exit order placed for PE leg (ScripCode: {pe_scrip_code}).")
-            except Exception as e:
-                logging.error(f"Error placing exit order for PE leg: {e}")
-
-        logging.info("All exit orders placed.")
-
-    final_pnl = realized_pnl
-    if ce_scrip_code in entry_data:
-        final_pnl += (entry_data[ce_scrip_code]['entry_price'] - ce_exit_price) * config.QTY
-    if pe_scrip_code in entry_data:
-        final_pnl += (entry_data[pe_scrip_code]['entry_price'] - pe_exit_price) * config.QTY
+            try: client.cancel_order(order_id)
+            except: pass
+        exit_lock = threading.Lock()
+        for leg, scrip in list(active_legs.items()):
+            _place_order_with_retry('B', scrip, config.QTY, lock=exit_lock)
 
     log_trade_to_csv({
-        'Date': datetime.date.today().isoformat(), 'Symbol': config.SYMBOL, 'EntryTime': config.ENTRY_TIME, 'ExitTime': datetime.datetime.now().strftime("%H:%M:%S"),
-        'Call_Strike': entry_data.get(ce_scrip_code, {}).get('strike', 0), 'Put_Strike': entry_data.get(pe_scrip_code, {}).get('strike', 0),
-        'Call_Entry_Premium': entry_data.get(ce_scrip_code, {}).get('entry_price', 0), 'Put_Entry_Premium': entry_data.get(pe_scrip_code, {}).get('entry_price', 0),
-        'Call_Exit_Price': ce_exit_price, 'Put_Exit_Price': pe_exit_price, 'Final_PnL': final_pnl, 'Exit_Reason': reason, 'Trade_Mode': 'PAPER' if config.PAPER_TRADING else 'LIVE'
+        'Date': datetime.date.today().isoformat(), 'Symbol': config.SYMBOL, 'EntryTime': config.ENTRY_TIME,
+        'ExitTime': datetime.datetime.now().strftime("%H:%M:%S"), 'Call_Strike': entry_data.get(ce_scrip_code, {}).get('strike', 0),
+        'Put_Strike': entry_data.get(pe_scrip_code, {}).get('strike', 0), 'Call_Entry_Premium': entry_data.get(ce_scrip_code, {}).get('entry_price', 0),
+        'Put_Entry_Premium': entry_data.get(pe_scrip_code, {}).get('entry_price', 0),
+        'Call_Exit_Price': ltp_store.get(ce_scrip_code, 0), 'Put_Exit_Price': ltp_store.get(pe_scrip_code, 0),
+        'Final_PnL': get_current_pnl(), 'Exit_Reason': reason, 'Trade_Mode': 'PAPER' if config.PAPER_TRADING else 'LIVE'
     })
 
-    pending_sl_order_ids, entry_data, realized_pnl, max_pnl, active_legs = [], {}, 0, 0, {}
     trade_is_active, trailing_sl_activated = False, False
-    ce_scrip_code, pe_scrip_code = None, None
-    logging.info("Trade closed and state reset.")
+    pending_sl_order_ids, entry_data, active_legs, realized_pnl, max_pnl, current_trailing_sl, ce_scrip_code, pe_scrip_code = [], {}, {}, 0, 0, 0, None, None
 
 def monitor_positions():
-    global active_legs, realized_pnl
-    try:
-        if not trade_is_active or not active_legs:
-            return
+    global realized_pnl
+    if not trade_is_active: return
+    live_scrip_codes = {p['ScripCode'] for p in (client.positions() or [])}
+    for leg, scrip in list(active_legs.items()):
+        if scrip not in live_scrip_codes:
+            logging.warning(f"{leg} leg closed (likely SL hit).")
+            pnl = (entry_data[scrip]['entry_price'] - ltp_store.get(scrip, entry_data[scrip]['entry_price'])) * config.QTY
+            realized_pnl += pnl
+            del active_legs[leg]
+            if config.EXIT_STRATEGY_ON_LEG_SL_HIT:
+                action_queue.put({'action': 'exit', 'reason': 'LEG_SL_HIT_EXIT'})
+                return
+    if not active_legs:
+        action_queue.put({'action': 'exit', 'reason': 'BOTH_LEGS_CLOSED'})
 
-        live_positions = client.positions()
-        if live_positions is None: # client.positions() can return None on error
-            logging.warning("Could not fetch live positions to monitor legs.")
-            return
+def log_pnl_status():
+    if not trade_is_active: return
+    pnl = get_current_pnl()
+    if trailing_sl_activated:
+        logging.info(f"P&L: {pnl:,.2f} | Max P&L: {max_pnl:,.2f} | Trailing SL: {current_trailing_sl:,.2f}")
+    else:
+        logging.info(f"P&L: {pnl:,.2f}")
 
-        live_scrip_codes = {p['ScripCode'] for p in live_positions}
+def log_trade_to_csv(data):
+    file_path = os.path.join(os.path.dirname(__file__), 'trade_log.csv')
+    with open(file_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=data.keys())
+        if not isfile(file_path) or os.path.getsize(file_path) == 0: writer.writeheader()
+        writer.writerow(data)
 
-        closed_legs = []
-        for leg_type, scrip_code in active_legs.items():
-            if scrip_code not in live_scrip_codes:
-                closed_legs.append(leg_type)
-
-        if closed_legs:
-            for leg_type in closed_legs:
-                scrip_code = active_legs.pop(leg_type) # Remove from active and get scrip code
-                logging.warning(f"Detected that the {leg_type} leg (ScripCode: {scrip_code}) has been closed, likely due to SL hit.")
-
-                # Update realized P&L
-                leg_exit_price = ltp_store.get(scrip_code, entry_data[scrip_code]['entry_price']) # Fallback to entry price if LTP not available
-                pnl = (entry_data[scrip_code]['entry_price'] - leg_exit_price) * config.QTY
-                realized_pnl += pnl
-                logging.info(f"Updated realized P&L by {pnl}. New total realized P&L: {realized_pnl}")
-
-                if config.EXIT_STRATEGY_ON_LEG_SL_HIT:
-                    logging.info(f"EXIT_ON_LEG_SL_HIT is True. Exiting remaining position.")
-                    action_queue.put({'action': 'exit', 'reason': 'LEG_SL_HIT_EXIT'})
-                    return # Exit immediately, no need to check other legs
-
-    except Exception as e:
-        logging.error(f"Error in position monitor: {e}")
-
-
-def log_trade_to_csv(trade_data):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(script_dir, 'trade_log.csv')
-    file_exists = isfile(file_path)
-    with open(file_path, 'a', newline='') as csvfile:
-        fieldnames = ['Date', 'Symbol', 'EntryTime', 'ExitTime', 'Call_Strike', 'Put_Strike', 'Call_Entry_Premium', 'Put_Entry_Premium', 'Call_Exit_Price', 'Put_Exit_Price', 'Final_PnL', 'Exit_Reason', 'Trade_Mode']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        if not file_exists: writer.writeheader()
-        writer.writerow(trade_data)
+def handle_user_commands():
+    """Handles manual user commands from the terminal."""
+    global config
+    logging.info("CLI enabled. Type 'SL <value>', 'TP <value>', 'TRAIL <value>', 'LOCK <value>', or 'EXIT'.")
+    while True:
+        try:
+            command = input("").strip().upper()
+            if not command: continue
+            parts = command.split()
+            cmd = parts[0]
+            if cmd == 'EXIT':
+                action_queue.put({'action': 'exit', 'reason': 'MANUAL_EXIT'})
+                continue
+            if len(parts) < 2: continue
+            value = float(parts[1])
+            if cmd == 'SL': config.OVERALL_SL = -abs(value)
+            elif cmd == 'TP': config.OVERALL_TARGET = value
+            elif cmd == 'TRAIL': config.TRAILING_PROFIT_TRIGGER = value
+            elif cmd == 'LOCK': config.TRAILING_PROFIT_LOCKIN = value
+            logging.info(f"Updated {cmd} to {value}")
+        except (EOFError, KeyboardInterrupt): break
+        except Exception as e: logging.error(f"CLI Error: {e}")
 
 if __name__ == "__main__":
-    logging.info("Starting trading bot...")
     ws_manager = WebSocketManager()
     ws_manager.start()
-    logging.info("Waiting for websocket to connect...")
     time.sleep(5)
 
+    cli_thread = threading.Thread(target=handle_user_commands, daemon=True)
+    cli_thread.start()
+
     if len(sys.argv) > 1 and sys.argv[1] == '--now':
-        logging.info("'--now' argument detected. Placing order immediately.")
         place_strangle_order()
-        logging.info("Entering monitoring mode for instant trade. Script will exit when trade is closed.")
-        last_monitor_time = time.time()
-        while trade_is_active:
-            if time.time() - last_monitor_time > 5:
-                monitor_positions()
-                last_monitor_time = time.time()
-            try:
-                action = action_queue.get_nowait()
-                if action.get('action') == 'exit': exit_positions(reason=action.get('reason'))
-            except queue.Empty: pass
-            time.sleep(0.5)
-        logging.info("Instant trade session finished. Exiting.")
     else:
         schedule.every().day.at(config.ENTRY_TIME).do(place_strangle_order)
-        schedule.every().day.at(config.EXIT_TIME).do(lambda: exit_positions(reason="TIMED_EXIT"))
-        schedule.every(5).seconds.do(monitor_positions)
-        logging.info(f"Scheduler started. Entry at {config.ENTRY_TIME}, Exit at {config.EXIT_TIME}, Position Monitor every 5s.")
-        while True:
-            schedule.run_pending()
-            try:
-                action = action_queue.get_nowait()
-                if action.get('action') == 'exit': exit_positions(reason=action.get('reason'))
-            except queue.Empty: pass
-            time.sleep(1)
+        schedule.every().day.at(config.EXIT_TIME).do(lambda: action_queue.put({'action': 'exit', 'reason': 'TIMED_EXIT'}))
+
+    schedule.every(5).seconds.do(monitor_positions)
+    schedule.every(10).seconds.do(log_pnl_status)
+
+    while True:
+        schedule.run_pending()
+        try:
+            action = action_queue.get_nowait()
+            if action.get('action') == 'exit':
+                exit_positions(reason=action.get('reason'))
+                if len(sys.argv) > 1 and sys.argv[1] == '--now': break # Exit script if in --now mode
+        except queue.Empty:
+            pass
+        time.sleep(1)

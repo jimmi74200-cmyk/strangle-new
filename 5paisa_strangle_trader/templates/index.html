@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Configuration Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-4">
+        <h1 class="mb-4">Trading Bot Configuration</h1>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+                        {{ message }}
+                        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <form action="/" method="post">
+            {% for category, params in schema.items() %}
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h4>{{ category }}</h4>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            {% for key, expected_type in params.items() %}
+                                {% set value = categorized_config[category][key] %}
+                                <div class="col-md-6 mb-3" id="{{ key }}_container">
+                                    <label for="{{ key }}" class="form-label">{{ key.replace('_', ' ').title() }}</label>
+
+                                    {% if expected_type == bool %}
+                                        <select class="form-select" id="{{ key }}" name="{{ key }}">
+                                            <option value="True" {% if value == True %}selected{% endif %}>True</option>
+                                            <option value="False" {% if value == False %}selected{% endif %}>False</option>
+                                        </select>
+
+                                    {% elif isinstance(expected_type, list) %}
+                                        <select class="form-select" id="{{ key }}" name="{{ key }}">
+                                            {% for option in expected_type %}
+                                            <option value="{{ option }}" {% if value|string|upper == option|upper %}selected{% endif %}>{{ option.replace('_', ' ').title() }}</option>
+                                            {% endfor %}
+                                        </select>
+
+                                    {% elif expected_type == 'time' %}
+                                        <input type="time" class="form-control" id="{{ key }}" name="{{ key }}" value="{{ value }}" required>
+
+                                    {# Use type="text" for numbers to preserve exact formatting like .0 #}
+                                    {% elif expected_type == int or expected_type == float %}
+                                        <input type="text" class="form-control" id="{{ key }}" name="{{ key }}" value="{{ value }}"
+                                               inputmode="decimal" pattern="^-?[0-9]+(\.[0-9]+)?$" required>
+
+                                    {% else %} {# Default to text input for str type #}
+                                        <input type="text" class="form-control" id="{{ key }}" name="{{ key }}" value="{{ value }}" required>
+                                    {% endif %}
+                                </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                </div>
+            {% endfor %}
+            <div class="d-grid">
+                <button type="submit" class="btn btn-primary btn-lg">Save All Configurations</button>
+            </div>
+        </form>
+        <footer class="mt-4 text-center text-muted">
+            <p>Run this server by executing `python dashboard.py` in your terminal.</p>
+        </footer>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const strikeMethodSelector = document.getElementById('STRIKE_SELECTION_METHOD');
+            const premiumContainer = document.getElementById('PREMIUM_container');
+            const distanceContainer = document.getElementById('STRANGLE_STRIKE_DISTANCE_container');
+            const gapContainer = document.getElementById('STRANGLE_GAP_POINTS_container');
+
+            function toggleStrikeParams() {
+                const selectedMethod = strikeMethodSelector.value;
+                if (premiumContainer) premiumContainer.style.display = 'none';
+                if (distanceContainer) distanceContainer.style.display = 'none';
+                if (gapContainer) gapContainer.style.display = 'none';
+
+                if (selectedMethod === 'NEAREST_PREMIUM') {
+                    if (premiumContainer) premiumContainer.style.display = 'block';
+                } else if (selectedMethod === 'OTM' || selectedMethod === 'ITM') {
+                    if (distanceContainer) distanceContainer.style.display = 'block';
+                } else if (selectedMethod === 'EQUAL_PREMIUM_GAP') {
+                    if (gapContainer) gapContainer.style.display = 'block';
+                }
+            }
+
+            if (strikeMethodSelector) {
+                strikeMethodSelector.addEventListener('change', toggleStrikeParams);
+            }
+            toggleStrikeParams();
+        });
+    </script>
+</body>
+</html>
