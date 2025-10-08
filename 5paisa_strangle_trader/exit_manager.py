@@ -101,7 +101,8 @@ def check_trade_conditions():
     elif pnl >= config.OVERALL_TARGET: action_queue.put({'action': 'exit', 'reason': 'OVERALL_TARGET_HIT'})
     elif trailing_sl_activated:
         if pnl > max_pnl: max_pnl = pnl
-        tsl_level = (int(max_pnl / config.TRAILING_PROFIT_TRIGGER)) * config.TRAILING_PROFIT_LOCKIN
+        # New "fixed drawdown" trailing stop-loss logic
+        tsl_level = max_pnl - config.TRAILING_PROFIT_LOCKIN
         current_trailing_sl = tsl_level
         if pnl < tsl_level: action_queue.put({'action': 'exit', 'reason': 'TRAILING_SL_HIT'})
     elif pnl >= config.TRAILING_PROFIT_TRIGGER:

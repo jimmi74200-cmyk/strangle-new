@@ -1,80 +1,97 @@
-# 5paisa Automated Intraday Option Strangle Selling Strategy
+# 5paisa Automated Intraday Option Strangle Strategy
 
-This project is a Python script that automates an intraday option strangle selling strategy using the 5paisa API.
+This project is a Python-based system for automating an intraday option strangle selling strategy using the 5paisa API. It includes a main trading bot, a standalone exit manager, and a web-based dashboard for configuration.
 
 ## Features
 
-- Login with 5paisa API using either TOTP or a web browser.
-- Automatically fetches the nearest weekly expiry for Nifty, Bank Nifty, etc.
-- Selects call and put strikes based on various methods: ATM, OTM, ITM, nearest premium, or a fixed point gap with equal premiums.
-- Places a short strangle order at a specific time (e.g., 9:30 AM).
-- Places exchange-level Stop-Loss Limit (SL-L) orders for each leg for better reliability.
-- Continuously monitors the overall P&L of the strategy.
-- Squares off all positions if the overall stop-loss, target, or trailing stop-loss is hit.
-- Squares off all positions at a specific time (e.g., 3:15 PM).
-- Includes a safety feature to exit the entire strategy if one leg's stop-loss is hit.
-- Logs all completed trades (both live and paper trades) to a `trade_log.csv` file for performance analysis.
-- Includes a **Paper Trading** mode that simulates trades and logs them accurately for safe testing.
+-   **Automated Trading:** Automatically places and exits short strangle trades based on a schedule.
+-   **Flexible Strike Selection:** Multiple methods for strike selection (ATM, OTM, Nearest Premium, etc.).
+-   **Advanced Risk Management:** Manages overall P&L with a target, stop-loss, and a dynamic trailing stop-loss.
+-   **Web Dashboard:** A user-friendly web interface to view and edit the strategy configuration (`config.py`) safely.
+-   **Standalone Exit Manager:** A separate script to take over management of an existing trade, providing robustness in case the main bot is stopped.
+-   **Live Manual Overrides:** A command-line interface (CLI) to adjust risk parameters (SL, TP, Trail) or exit a trade in real-time.
+-   **Paper Trading Mode:** Test your strategy without risking real capital.
+-   **Detailed Logging:** Logs all trades to a `trade_log.csv` file for performance analysis.
+-   **Secure Authentication:** Supports both TOTP and browser-based login flows to generate daily access tokens.
+
+## Project Components
+
+This repository contains several key scripts that work together:
+
+-   `trader.py`: The main, fully automated trading bot. It handles the entire lifecycle of a trade, from entry to management to exit.
+-   `exit_manager.py`: A standalone script designed to manage a position that is already open. If `trader.py` stops for any reason, you can run this script to "adopt" the open trade and manage it with the configured risk rules.
+-   `dashboard.py`: A web-based configuration dashboard. It provides a simple GUI to view and edit the parameters in `config.py`, reducing the risk of manual errors.
+-   `authenticate.py`: A script for fast, non-browser authentication using your TOTP (from an authenticator app). Recommended for servers.
+-   `authenticate_browser.py`: A script that uses your web browser to log in and fetch the daily access token.
+-   `config.py`: The central configuration file for all scripts.
 
 ## How to Use
 
 ### 1. Installation
 
 1.  Clone this repository.
-2.  Install the required Python libraries:
-    ```
-    pip install py5paisa schedule
+2.  Install the required Python libraries from the `requirements.txt` file:
+    ```bash
+    pip install -r 5paisa_strangle_trader/requirements.txt
     ```
 
 ### 2. Configuration
 
-1.  Open the `config.py` file and fill in your 5paisa API credentials (`APP_NAME`, `APP_SOURCE`, `USER_ID`, `PASSWORD`, `USER_KEY`, `ENCRYPTION_KEY`). You only need to do this once.
-2.  You can also configure the trading, strike selection, and risk management parameters in `config.py` to suit your strategy.
-3.  **Paper Trading:** By default, `PAPER_TRADING` is set to `True` for safety. In this mode, the script will simulate trades and log them to `trade_log.csv` with the `Trade_Mode` column set to `PAPER`. To place real trades, you must set this to `False`.
+You can configure the bot in two ways:
+
+#### Method A: Using the Web Dashboard (Recommended)
+
+1.  Run the dashboard script:
+    ```bash
+    python 5paisa_strangle_trader/dashboard.py
+    ```
+2.  Open your web browser and go to `http://127.0.0.1:5001`.
+3.  Modify your trading, strike selection, and risk parameters in the user-friendly interface and click "Save".
+
+#### Method B: Manually Editing `config.py`
+
+1.  Open `5paisa_strangle_trader/config.py` in a text editor.
+2.  Fill in your 5paisa API credentials (`APP_NAME`, `USER_KEY`, etc.) one time.
+3.  Adjust any trading parameters as needed.
 
 ### 3. Daily Authentication (Choose One Method)
 
-Before running the trading bot each day, you need to authenticate to get a new access token. You have two options:
+Before running the bot each day, you must generate a new access token.
 
-#### Method 1: TOTP-based Login (Recommended for servers)
+-   **TOTP-based:** Run `python 5paisa_strangle_trader/authenticate.py` and follow the prompts.
+-   **Browser-based:** Run `python 5paisa_strangle_trader/authenticate_browser.py`.
 
-This method is fast and does not require a web browser.
+Both scripts will automatically update the `ACCESS_TOKEN` in your `config.py` file.
 
-1.  Run the `authenticate.py` script:
-    ```
-    python authenticate.py
-    ```
-2.  The script will prompt you to enter your client code, TOTP (from your authenticator app), and PIN.
-3.  After successful authentication, the script will **automatically** update the `ACCESS_TOKEN` and `CLIENT_CODE` in your `config.py` file.
+### 4. Running the Main Bot
 
-#### Method 2: Browser-based Login
-
-This method is useful if you prefer to log in through your web browser.
-
-1.  Run the `authenticate_browser.py` script:
-    ```
-    python authenticate_browser.py
-    ```
-2.  Your default web browser will automatically open to the 5paisa login page.
-3.  Log in with your credentials. After you log in, you will be redirected to a blank page and the script will capture the login token.
-4.  The script will then **automatically** update the `ACCESS_TOKEN` and `CLIENT_CODE` in your `config.py` file.
-
-### 4. Running the Bot
-
-To start the trading bot, run the `trader.py` script:
-```
-python trader.py
-```
-
-The bot will then wait for the specified `ENTRY_TIME` to place the strangle order. It will also automatically square off all positions at the specified `EXIT_TIME`.
-
-### 5. Checking Your Profile
-
-You can use the `profile.py` script to fetch your account details and verify that your authentication is working correctly.
-
+To start the fully automated trading bot, run `trader.py`:
 ```bash
-python profile.py
+python 5paisa_strangle_trader/trader.py
 ```
+The bot will now wait for the `ENTRY_TIME` to place a trade and will manage it until `EXIT_TIME` or until a risk condition is met.
+
+### 5. Running the Exit Manager (If Needed)
+
+If `trader.py` has stopped but you have an open position, run `exit_manager.py` to take over:
+```bash
+python 5paisa_strangle_trader/exit_manager.py
+```
+It will scan your account, adopt the position, and start managing it immediately.
+
+## Manual CLI Commands
+
+While `trader.py` or `exit_manager.py` is running, you can take manual control by typing commands into the same terminal window.
+
+| Command      | Example      | Description                                                 |
+| :----------- | :----------- | :---------------------------------------------------------- |
+| `SL`         | `SL 800`     | Sets the **Overall Stop-Loss** to **-800**. (Value is made negative automatically). |
+| `TP`         | `TP 6000`    | Sets the **Overall Target** to **6000**.                      |
+| `TRAIL`      | `TRAIL 3000` | Sets the **Trailing Profit Trigger** to **3000**.             |
+| `LOCK`       | `LOCK 500`   | Sets the **Trailing Profit Lock-in** value to **500**.        |
+| `EXIT`       | `EXIT`       | Immediately triggers a market exit for the current position. |
+
+The script will log a confirmation message for each successful command.
 
 ## Disclaimer
 
